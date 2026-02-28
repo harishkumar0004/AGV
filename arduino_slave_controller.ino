@@ -62,7 +62,7 @@ void loop() {
   // Check for new command from Python
   if (Serial.available() > 0) {
     char cmd = Serial.read();
-
+k
     // Ignore line endings and whitespace from host tools/terminals
     if (cmd == '\n' || cmd == '\r' || cmd == ' ' || cmd == '\t') {
       return;

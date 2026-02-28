@@ -1,50 +1,55 @@
-import apriltag
 import cv2
-import numpy as np
+from pupil_apriltags import Detector
+import serial
+import time
 
 image = None
 cap = cv2.VideoCapture(0)
-# detector = apriltag.apriltag('tag36h11', threads=4)
-detector = apriltag.apriltag(
-    family='tag36h11',      # Tag family
-    threads=4,              # Number of threads
-    maxhamming=1,           # Maximum hamming distance for error correction
-    decimate=2.0,           # Image downsampling factor
-    blur=0.0,               # Gaussian blur sigma
-    refine_edges=True,      # Refine quad edges
-    debug=False             # Debug mode
-)
+detector = Detector(families="tag36h11")
+
+usb = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
+time.sleep(2)
+
+robot_state = "MOVING"
+expected_tag = None
 
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    detections = detector.detect(gray)
+try:
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        detections = detector.detect(gray)
 
-    # Draw detections
-    for det in detections:
-        pts = det['lb-rb-rt-lt'].astype(int)
-        cv2.polylines(frame, [pts], True, (0,255,0), 2)
-        cx, cy = map(int, det['center'])
-        cv2.circle(frame, (cx,cy), 5, (0,0,255), -1)
+        # Draw detections
+        for det in detections:
+            pts = det.corners.astype(int)
+            cv2.polylines(frame, [pts], True, (0,255,0), 2)
+            cx, cy = map(int, det.center)
+            cv2.circle(frame, (cx,cy), 5, (0,0,255), -1)
 
-        tag_id = det['id']
+            tag_id = det.tag_id
 
-        # position text above tag
-        x = pts[:,0].min()
-        y = pts[:,1].min() - 10
+            # position text above tag
+            x = pts[:,0].min()
+            y = pts[:,1].min() - 10
 
-        cv2.putText(frame, f"ID:{tag_id}", (x,y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (255,0,0), 2)
+            cv2.putText(frame, f"ID:{tag_id}", (x,y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (255,0,0), 2)
 
-    cv2.imshow('image', frame)
+            if (expected_tag is None or tag_id == expected_tag) and robot_state == "MOVING":
+                print("Tag detected -> STOP")
+                usb.write(b's')
+                robot_state = "STOPPED"
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        cv2.imshow('image', frame)
 
-
-# When everything done, release the capture
-cap.release()
-cv2.destroyAllWindows()
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+finally:
+    cap.release()
+    usb.close()
+    cv2.destroyAllWindows()
 
