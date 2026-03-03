@@ -35,10 +35,14 @@ float yaw     = 0;
 float targetYaw = 0;
 unsigned long lastGyroTime = 0;
 float gzFiltered = 0.0f;
+float straightPrevErr = 0.0f;
+float straightCorr    = 0.0f;
+unsigned long lastStraightTime = 0;
 
-// Straight-line P controller
-const float Kp_straight    = 1.5f;      // lower gain to tame oscillation
-const float MAX_CORRECTION = 150.0f;    // cap steering asymmetry
+// Straight-line PD controller
+const float Kp_straight    = 0.9f;      // softer P gain
+const float Kd_straight    = 0.08f;     // yaw-rate damping
+const float MAX_CORRECTION = 120.0f;    // cap steering asymmetry
 
 // Rotation P controller zones (degrees)
 const float FAST_ZONE = 30.0f;
@@ -243,11 +247,25 @@ void runStraightController() {
   if (err >  180.0f) err -= 360.0f;
   if (err < -180.0f) err += 360.0f;
 
-  float correction = Kp_straight * err;
-  correction = constrain(correction, -MAX_CORRECTION, MAX_CORRECTION);
+  unsigned long now = millis();
+  float dt = (now - lastStraightTime) / 1000.0f;
+  if (dt <= 0.0f) dt = 0.01f;
+  if (dt > 0.2f)   dt = 0.2f;  // avoid huge derivative on pauses
+  lastStraightTime = now;
+
+  float errRate    = (err - straightPrevErr) / dt;
+  straightPrevErr  = err;
+
+  float desiredCorr = (Kp_straight * err) + (Kd_straight * errRate);
+  desiredCorr = constrain(desiredCorr, -MAX_CORRECTION, MAX_CORRECTION);
+
+  // Slew-limit correction to prevent step-interval flip-flop
+  float step = desiredCorr - straightCorr;
+  step = constrain(step, -5.0f, 5.0f);
+  straightCorr += step;
 
   long base    = (long)TRAVEL_INTERVAL;
-  long corrInt = (long)correction;
+  long corrInt = (long)straightCorr;
 
   // keep both wheels within a sensible speed band to avoid hunting
   leftInterval  = (unsigned long)constrain(base + corrInt, 35L, 220L);
@@ -262,6 +280,9 @@ void applyDirection(char dir) {
       targetYaw     = yaw;
       leftInterval  = TRAVEL_INTERVAL;
       rightInterval = TRAVEL_INTERVAL;
+      straightCorr  = 0.0f;
+      straightPrevErr = 0.0f;
+      lastStraightTime = millis();
       motorsRunning = true;
       digitalWrite(dirPin1, HIGH);
       digitalWrite(dirPin2, LOW);
@@ -273,6 +294,9 @@ void applyDirection(char dir) {
       targetYaw     = yaw;
       leftInterval  = TRAVEL_INTERVAL;
       rightInterval = TRAVEL_INTERVAL;
+      straightCorr  = 0.0f;
+      straightPrevErr = 0.0f;
+      lastStraightTime = millis();
       motorsRunning = true;
       digitalWrite(dirPin1, LOW);
       digitalWrite(dirPin2, HIGH);
