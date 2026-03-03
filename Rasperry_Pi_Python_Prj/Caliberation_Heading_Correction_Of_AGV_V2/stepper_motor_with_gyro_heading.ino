@@ -16,7 +16,7 @@ const int enPin2   = 27;
 //   50us  = 60 RPM = 0.38 m/s  (travel)
 //   80us  = 37 RPM             (turn fast)
 //   500us = 6 RPM              (turn slow/creep)
-const unsigned long TRAVEL_INTERVAL  = 50;
+const unsigned long TRAVEL_INTERVAL  = 70;   // slow travel to reduce slip/oscillation
 const unsigned long TURN_FAST        = 80;
 const unsigned long TURN_SLOW        = 500;
 const unsigned long STOPPED_INTERVAL = 99999;
@@ -39,10 +39,10 @@ float straightPrevErr = 0.0f;
 float straightCorr    = 0.0f;
 unsigned long lastStraightTime = 0;
 
-// Straight-line PD controller
-const float Kp_straight    = 0.9f;      // softer P gain
-const float Kd_straight    = 0.08f;     // yaw-rate damping
-const float MAX_CORRECTION = 120.0f;    // cap steering asymmetry
+// Straight-line PD controller (gentler to avoid weaving)
+const float Kp_straight    = 0.6f;
+const float Kd_straight    = 0.05f;
+const float MAX_CORRECTION = 80.0f;
 
 // Rotation P controller zones (degrees)
 const float FAST_ZONE = 30.0f;
@@ -246,6 +246,8 @@ void runStraightController() {
   float err = targetYaw - yaw;
   if (err >  180.0f) err -= 360.0f;
   if (err < -180.0f) err += 360.0f;
+  // deadband small errors to avoid constant hunting
+  if (fabsf(err) < 0.8f) err = 0.0f;
 
   unsigned long now = millis();
   float dt = (now - lastStraightTime) / 1000.0f;
@@ -261,15 +263,19 @@ void runStraightController() {
 
   // Slew-limit correction to prevent step-interval flip-flop
   float step = desiredCorr - straightCorr;
-  step = constrain(step, -5.0f, 5.0f);
+  step = constrain(step, -2.0f, 2.0f);
   straightCorr += step;
+  // bleed correction to zero when no error to keep wheels balanced
+  if (err == 0.0f) {
+    straightCorr *= 0.98f;
+  }
 
   long base    = (long)TRAVEL_INTERVAL;
   long corrInt = (long)straightCorr;
 
   // keep both wheels within a sensible speed band to avoid hunting
-  leftInterval  = (unsigned long)constrain(base + corrInt, 35L, 220L);
-  rightInterval = (unsigned long)constrain(base - corrInt, 35L, 220L);
+  leftInterval  = (unsigned long)constrain(base + corrInt, 60L, 300L);
+  rightInterval = (unsigned long)constrain(base - corrInt, 60L, 300L);
 }
 
 // ======================================================
