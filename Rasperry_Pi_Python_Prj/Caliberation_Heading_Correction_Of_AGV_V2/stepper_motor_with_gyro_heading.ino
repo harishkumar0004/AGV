@@ -3,357 +3,336 @@
 
 MPU6050 Gyro;
 
-// ----------------------
 // Stepper Pins
-// ----------------------
 const int stepPin1 = 22;
 const int dirPin1  = 24;
 const int enPin1   = 26;
-
 const int stepPin2 = 23;
 const int dirPin2  = 25;
 const int enPin2   = 27;
 
-// ----------------------
-// Stepper Control
-// ----------------------
-volatile unsigned long lastStepTime1 = 0;
-volatile unsigned long lastStepTime2 = 0;
+// Speed constants (microseconds per half-step)
+// At 20000 pulses/rev, 122mm wheel diameter:
+//   50us  = 60 RPM = 0.38 m/s  (travel)
+//   80us  = 37 RPM             (turn fast)
+//   500us = 6 RPM              (turn slow/creep)
+const unsigned long TRAVEL_INTERVAL  = 50;
+const unsigned long TURN_FAST        = 80;
+const unsigned long TURN_SLOW        = 500;
+const unsigned long STOPPED_INTERVAL = 99999;
 
-unsigned long baseInterval = 50;    // microseconds per half-step
-unsigned long leftInterval  = 1000;
-unsigned long rightInterval = 1000;
-
+unsigned long leftInterval  = STOPPED_INTERVAL;
+unsigned long rightInterval = STOPPED_INTERVAL;
 volatile boolean stepState1 = LOW;
 volatile boolean stepState2 = LOW;
+volatile unsigned long lastStepTime1 = 0;
+volatile unsigned long lastStepTime2 = 0;
+bool motorsRunning = false;
 
-volatile int stepCount1 = 0;
-volatile int stepCount2 = 0;
-const int MAX_STEPS = 52166;          // max steps for distance calculation
-
-bool motorsRunning = false;           // MOTORS DO NOTHING until Pi sends a command
-bool distanceReached = false;         // flag for distance-based movement
-unsigned long targetSteps = 0;        // target distance in steps
-
-// ----------------------
-// Gyro Variables
-// ----------------------
-float gzBias = 0;
-float yaw = 0;
+// Gyro
+float gzBias  = 0;
+float yaw     = 0;
 float targetYaw = 0;
-
-const float dt = 0.01;
 unsigned long lastGyroTime = 0;
+float gzFiltered = 0.0f;
 
-// ----------------------
-// Heading Control
-// ----------------------
-float Kp = 2.0;
-float maxCorrection = 400.0;
+// Straight-line P controller
+const float Kp_straight    = 1.5f;      // lower gain to tame oscillation
+const float MAX_CORRECTION = 150.0f;    // cap steering asymmetry
 
-// For rotation-based commands (l, r, b - 180 degree)
-float initialYaw = 0.0f;
-float targetRotation = 0.0f;        // target rotation angle in degrees
-bool isRotationCommand = false;     // flag to indicate if current command is rotation-based
+// Rotation P controller zones (degrees)
+const float FAST_ZONE = 30.0f;
+const float SLOW_ZONE = 10.0f;  // ease into stop sooner
+const float STOP_ZONE = 5.0f;   // stop a little early to avoid endless spin
 
-// ----------------------
-// Serial Command Control
-// ----------------------
-char currentDirection = 's';         // Start STOPPED — no movement on power-on
-char prevDirection    = 's';
+float initialYaw     = 0.0f;
+float targetRotation = 0.0f;
+bool  isRotating     = false;
+
+// Telemetry throttle
+const unsigned long TELEMETRY_INTERVAL = 50;  // ms
+unsigned long lastTelemetry = 0;
+
+// Command control
+char currentDirection = 's';
+char prevDirection    = 'X';   // force first applyDirection on boot
 unsigned long lastCommandTime = 0;
-const unsigned long commandTimeout = 600;  // ms
+const unsigned long CMD_TIMEOUT = 700;
 
-// For parsing distance commands
-String serialBuffer = "";            // buffer for serial input
-
-// ----------------------
-// Setup
-// ----------------------
+// ======================================================
 void setup() {
   Serial.begin(115200);
   Wire.begin();
+
+  pinMode(stepPin1, OUTPUT); pinMode(dirPin1, OUTPUT); pinMode(enPin1, OUTPUT);
+  pinMode(stepPin2, OUTPUT); pinMode(dirPin2, OUTPUT); pinMode(enPin2, OUTPUT);
+
+  // Motors OFF during calibration
+  digitalWrite(enPin1, HIGH);
+  digitalWrite(enPin2, HIGH);
+  digitalWrite(stepPin1, LOW);
+  digitalWrite(stepPin2, LOW);
 
   Gyro.initialize();
   Gyro.setSleepEnabled(false);
   Gyro.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
 
-  pinMode(stepPin1, OUTPUT);
-  pinMode(dirPin1,  OUTPUT);
-  pinMode(enPin1,   OUTPUT);
-  pinMode(stepPin2, OUTPUT);
-  pinMode(dirPin2,  OUTPUT);
-  pinMode(enPin2,   OUTPUT);
+  // Warm-up: let MPU6050 thermally stabilise before calibrating
+  Serial.println("Warming up (3s) keep still...");
+  delay(3000);
 
-  // Keep motors DISABLED during calibration
-  digitalWrite(enPin1, HIGH);
-  digitalWrite(enPin2, HIGH);
-
-  // Step pins LOW
-  digitalWrite(stepPin1, LOW);
-  digitalWrite(stepPin2, LOW);
-
-  Serial.println("Calibrating gyro, keep robot still...");
   calibrateGyroBias();
-  Serial.print("Gyro bias: ");
-  Serial.println(gzBias, 4);
 
-  // Enable motors AFTER calibration — but motorsRunning is still false
+  Serial.print("Bias: ");
+  Serial.println(gzBias, 5);
+
+  // Enable motors
   digitalWrite(enPin1, LOW);
   digitalWrite(enPin2, LOW);
 
   yaw = 0.0f;
   targetYaw = 0.0f;
-  lastGyroTime  = millis();
+  lastGyroTime    = millis();
   lastCommandTime = millis();
 
-  Serial.println("AGV Ready — waiting for command from Pi");
-  Serial.println("Commands: f=forward, b=backward, l=left, r=right, s=stop");
+  Serial.println("READY f=fwd b=back l=left90 r=right90 s=stop");
 }
 
-// ----------------------
-// Main Loop
-// ----------------------
+// ======================================================
 void loop() {
 
-  // ----------------------
-  // Read Serial Commands from Pi
-  // ----------------------
+  // --- Serial input ---
   while (Serial.available()) {
     char cmd = Serial.read();
-    if (cmd == '?') {
-      // Ping/health check from Pi
-      Serial.println("ACK");
-      lastCommandTime = millis();
-    } else if (cmd == 'h') {
-      // Heading snapshot for debugging
-      Serial.print("STATUS yaw:");
-      Serial.print(yaw, 2);
-      Serial.print(" tgt:");
-      Serial.print(targetYaw, 2);
-      Serial.print(" dir:");
-      Serial.println(currentDirection);
-      lastCommandTime = millis();
-    } else if (cmd == 'd') {
-      // Distance command: parse number until newline
-      serialBuffer = "";
-      while (Serial.available()) {
-        char c = Serial.read();
-        if (c == '\n' || c == '\r') {
-          break;
-        }
-        if (isdigit(c)) {
-          serialBuffer += c;
-        }
-      }
-      if (serialBuffer.length() > 0) {
-        targetSteps = (unsigned long)serialBuffer.toInt();
-        Serial.print("Distance set to: ");
-        Serial.print(targetSteps);
-        Serial.println(" steps");
-        lastCommandTime = millis();
-      }
-    } else if (cmd == 'f' || cmd == 'b' || cmd == 'l' || cmd == 'r' || cmd == 's') {
+    if (cmd == 'f' || cmd == 'b' || cmd == 'l' || cmd == 'r' || cmd == 's') {
       currentDirection = cmd;
       lastCommandTime  = millis();
+    } else if (cmd == '?') {
+      Serial.print("ACK y:");
+      Serial.print(yaw, 2);
+      Serial.print(" d:");
+      Serial.println(currentDirection);
+      lastCommandTime = millis();
     }
+    // ignore newlines, spaces, other chars
   }
 
-  // Safety: auto-stop if Pi goes silent
-  if (millis() - lastCommandTime > commandTimeout) {
+  // Safety: Pi silent -> stop
+  if (millis() - lastCommandTime > CMD_TIMEOUT) {
     currentDirection = 's';
   }
 
-  // Apply direction only when it changes
+  // Apply only on change
   if (currentDirection != prevDirection) {
     applyDirection(currentDirection);
     prevDirection = currentDirection;
   }
 
-  // ----------------------
-  // Stepper Pulse Generation
-  // — only runs when motorsRunning = true
-  // ----------------------
-  unsigned long currentMicros = micros();
-
-  // Motor 1 (Left)
-  if (motorsRunning && (currentMicros - lastStepTime1 >= leftInterval / 2)) {
-    stepState1 = !stepState1;
-    digitalWrite(stepPin1, stepState1);
-    lastStepTime1 = currentMicros;
-
-    if (stepState1 == LOW) stepCount1++;   // count on falling edge
-  }
-
-  // Motor 2 (Right)
-  if (motorsRunning && (currentMicros - lastStepTime2 >= rightInterval / 2)) {
-    stepState2 = !stepState2;
-    digitalWrite(stepPin2, stepState2);
-    lastStepTime2 = currentMicros;
-
-    if (stepState2 == LOW) stepCount2++;   // count on falling edge
-  }
-
-  // ----------------------
-  // Check if target distance reached (for f command)
-  // ----------------------
-  if (motorsRunning && currentDirection == 'f' && targetSteps > 0) {
-    if (stepCount1 >= targetSteps && stepCount2 >= targetSteps) {
-      motorsRunning = false;
-      currentDirection = 's';
-      Serial.println("Target distance reached — stopping");
+  // --- Stepper pulses ---
+  unsigned long now = micros();
+  if (motorsRunning) {
+    if (now - lastStepTime1 >= leftInterval / 2) {
+      stepState1 = !stepState1;
+      digitalWrite(stepPin1, stepState1);
+      lastStepTime1 = now;
+    }
+    if (now - lastStepTime2 >= rightInterval / 2) {
+      stepState2 = !stepState2;
+      digitalWrite(stepPin2, stepState2);
+      lastStepTime2 = now;
     }
   }
 
-  // ----------------------
-  // Check if rotation target reached (for b, l, r commands)
-  // ----------------------
-  if (motorsRunning && isRotationCommand) {
-    float currentRotation = yaw - initialYaw;
-    if (currentRotation > 180.0f) currentRotation -= 360.0f;
-    if (currentRotation < -180.0f) currentRotation += 360.0f;
-
-    if (abs(currentRotation - targetRotation) < 5.0f) {  // 5 degree tolerance
-      motorsRunning = false;
-      currentDirection = 's';
-      isRotationCommand = false;
-      Serial.print("Target rotation reached (");
-      Serial.print(targetRotation, 1);
-      Serial.println(" deg) — stopping");
-    }
-  }
-
-  // ----------------------
-  // Gyro Update at 100 Hz
-  // ----------------------
-  if (millis() - lastGyroTime >= 10) {
-    lastGyroTime += 10;
+  // --- Gyro & control loop ---
+  unsigned long nowGyro = millis();
+  if (nowGyro - lastGyroTime >= 5) { // run at ~200 Hz max
+    float dt = (nowGyro - lastGyroTime) / 1000.0f;
+    if (dt <= 0.0f || dt > 0.2f) dt = 0.01f;  // clamp outliers
+    lastGyroTime = nowGyro;
 
     int16_t gx, gy, gzRaw;
     Gyro.getRotation(&gx, &gy, &gzRaw);
 
     float gz = (gzRaw / 131.0f) - gzBias;
-    if (abs(gz) < 0.05f) gz = 0.0f;   // deadband
+    if (fabsf(gz) < 0.08f) gz = 0.0f;  // noise deadband
+    // simple low-pass to smooth spikes
+    gzFiltered = 0.9f * gzFiltered + 0.1f * gz;
+    gz = gzFiltered;
 
     yaw += gz * dt;
-
     if (yaw >  180.0f) yaw -= 360.0f;
     if (yaw < -180.0f) yaw += 360.0f;
 
-    // Heading correction — only when driving straight
-    if (motorsRunning && (currentDirection == 'f' || currentDirection == 'b')) {
-      float error = targetYaw - yaw;
-      if (error >  180.0f) error -= 360.0f;
-      if (error < -180.0f) error += 360.0f;
-
-      float correction = Kp * error;
-      correction = constrain(correction, -maxCorrection, maxCorrection);
-
-      long base     = (long)baseInterval;
-      long corrInt  = (long)correction;
-
-      leftInterval  = (unsigned long)constrain(base + corrInt, 25L, 200L);
-      rightInterval = (unsigned long)constrain(base - corrInt, 25L, 200L);
+    if (motorsRunning) {
+      if (isRotating) {
+        runRotationController();
+      } else {
+        runStraightController();
+      }
     }
 
-    // Debug to Pi
-    Serial.print("Yaw:");    Serial.print(yaw, 2);
-    Serial.print(" Tgt:");   Serial.print(targetYaw, 2);
-    Serial.print(" Dir:");   Serial.print(currentDirection);
-    Serial.print(" Steps1:"); Serial.print(stepCount1);
-    Serial.print(" Steps2:"); Serial.print(stepCount2);
-    Serial.print(" L:");     Serial.print(leftInterval);
-    Serial.print(" R:");     Serial.println(rightInterval);
+    // Telemetry throttled to avoid slowing control loop
+    if (nowGyro - lastTelemetry >= TELEMETRY_INTERVAL) {
+      lastTelemetry = nowGyro;
+      Serial.print("Y:"); Serial.print(yaw, 2);
+      Serial.print(" T:"); Serial.print(isRotating ? (initialYaw + targetRotation) : targetYaw, 2);
+      Serial.print(" E:"); Serial.print(isRotating ? getRotationError() : (targetYaw - yaw), 2);
+      Serial.print(" D:"); Serial.print(currentDirection);
+      Serial.print(" L:"); Serial.print(leftInterval);
+      Serial.print(" R:"); Serial.println(rightInterval);
+    }
   }
 }
 
-// ----------------------
-// Apply Direction (called only on change)
-// ----------------------
+// ======================================================
+float getRotationError() {
+  float rotated = yaw - initialYaw;
+  if (rotated >  180.0f) rotated -= 360.0f;
+  if (rotated < -180.0f) rotated += 360.0f;
+  float err = targetRotation - rotated;
+  if (err >  180.0f) err -= 360.0f;
+  if (err < -180.0f) err += 360.0f;
+  return err;
+}
+
+// ======================================================
+void runRotationController() {
+  float err    = getRotationError();
+  float absErr = fabsf(err);
+
+  if (absErr < STOP_ZONE) {
+    // Rotation complete
+    motorsRunning    = false;
+    isRotating       = false;
+    leftInterval     = STOPPED_INTERVAL;
+    rightInterval    = STOPPED_INTERVAL;
+    targetYaw        = yaw;
+    currentDirection = 's';
+    prevDirection    = 's';
+    Serial.print("ROT_DONE y:");
+    Serial.println(yaw, 2);
+    return;
+  }
+
+  // Proportional speed
+  unsigned long interval;
+  if (absErr >= FAST_ZONE) {
+    interval = TURN_FAST;
+  } else if (absErr <= SLOW_ZONE) {
+    interval = TURN_SLOW;
+  } else {
+    float t  = (absErr - SLOW_ZONE) / (FAST_ZONE - SLOW_ZONE);
+    interval = (unsigned long)(TURN_SLOW - t * (TURN_SLOW - TURN_FAST));
+  }
+  leftInterval  = interval;
+  rightInterval = interval;
+
+  // Auto-correct direction if overshoot
+  if (err > 0) {
+    digitalWrite(dirPin1, HIGH);  // left fwd
+    digitalWrite(dirPin2, HIGH);  // right back  -> turns right
+  } else {
+    digitalWrite(dirPin1, LOW);   // left back
+    digitalWrite(dirPin2, LOW);   // right fwd   -> turns left
+  }
+}
+
+// ======================================================
+void runStraightController() {
+  float err = targetYaw - yaw;
+  if (err >  180.0f) err -= 360.0f;
+  if (err < -180.0f) err += 360.0f;
+
+  float correction = Kp_straight * err;
+  correction = constrain(correction, -MAX_CORRECTION, MAX_CORRECTION);
+
+  long base    = (long)TRAVEL_INTERVAL;
+  long corrInt = (long)correction;
+
+  // keep both wheels within a sensible speed band to avoid hunting
+  leftInterval  = (unsigned long)constrain(base + corrInt, 35L, 220L);
+  rightInterval = (unsigned long)constrain(base - corrInt, 35L, 220L);
+}
+
+// ======================================================
 void applyDirection(char dir) {
   switch (dir) {
-
     case 'f':
-      baseInterval  = 50;
-      leftInterval  = baseInterval;
-      rightInterval = baseInterval;
-      stepCount1    = 0;
-      stepCount2    = 0;
-      targetYaw     = yaw;          // lock current heading
-      targetSteps   = MAX_STEPS;    // default: use full MAX_STEPS, can be overridden by Pi
-      isRotationCommand = false;
+      isRotating    = false;
+      targetYaw     = yaw;
+      leftInterval  = TRAVEL_INTERVAL;
+      rightInterval = TRAVEL_INTERVAL;
       motorsRunning = true;
       digitalWrite(dirPin1, HIGH);
       digitalWrite(dirPin2, LOW);
-      Serial.println("CMD: Forward");
+      Serial.println("CMD:f");
       break;
 
     case 'b':
-      baseInterval  = 50;
-      leftInterval  = baseInterval;
-      rightInterval = baseInterval;
-      stepCount1    = 0;
-      stepCount2    = 0;
-      initialYaw    = yaw;          // save current heading
-      targetRotation = 180.0f;      // turn exactly 180 degrees
-      isRotationCommand = true;
+      isRotating    = false;
+      targetYaw     = yaw;
+      leftInterval  = TRAVEL_INTERVAL;
+      rightInterval = TRAVEL_INTERVAL;
       motorsRunning = true;
-      digitalWrite(dirPin1, LOW);   // reverse direction
+      digitalWrite(dirPin1, LOW);
       digitalWrite(dirPin2, HIGH);
-      Serial.println("CMD: Backward (180-degree turn)");
+      Serial.println("CMD:b");
       break;
 
     case 'l':
-      leftInterval  = 100;
-      rightInterval = 100;
-      stepCount1    = 0;
-      stepCount2    = 0;
-      initialYaw    = yaw;          // save current heading
-      targetRotation = -90.0f;      // turn 90 degrees left
-      isRotationCommand = true;
-      motorsRunning = true;
-      digitalWrite(dirPin1, LOW);   // left motor reverse
-      digitalWrite(dirPin2, LOW);   // right motor forward
-      Serial.println("CMD: Left (90-degree turn)");
+      initialYaw     = yaw;
+      targetRotation = -90.0f;
+      isRotating     = true;
+      leftInterval   = TURN_FAST;
+      rightInterval  = TURN_FAST;
+      motorsRunning  = true;
+      digitalWrite(dirPin1, LOW);
+      digitalWrite(dirPin2, LOW);
+      Serial.println("CMD:l");
       break;
 
     case 'r':
-      leftInterval  = 100;
-      rightInterval = 100;
-      stepCount1    = 0;
-      stepCount2    = 0;
-      initialYaw    = yaw;          // save current heading
-      targetRotation = 90.0f;       // turn 90 degrees right
-      isRotationCommand = true;
-      motorsRunning = true;
-      digitalWrite(dirPin1, HIGH);  // left motor forward
-      digitalWrite(dirPin2, HIGH);  // right motor reverse
-      Serial.println("CMD: Right (90-degree turn)");
+      initialYaw     = yaw;
+      targetRotation = 90.0f;
+      isRotating     = true;
+      leftInterval   = TURN_FAST;
+      rightInterval  = TURN_FAST;
+      motorsRunning  = true;
+      digitalWrite(dirPin1, HIGH);
+      digitalWrite(dirPin2, HIGH);
+      Serial.println("CMD:r");
       break;
 
     case 's':
-      motorsRunning = false;        // stop pulse generation immediately
-      stepCount1    = 0;
-      stepCount2    = 0;
-      isRotationCommand = false;
-      targetSteps = 0;
-      Serial.println("CMD: Stop");
+      motorsRunning  = false;
+      isRotating     = false;
+      leftInterval   = STOPPED_INTERVAL;
+      rightInterval  = STOPPED_INTERVAL;
+      Serial.println("CMD:s");
       break;
   }
 }
 
-// ----------------------
-// Gyro Bias Calibration
-// ----------------------
+// ======================================================
+// Calibration: 2000 samples x 5ms = 10 seconds
+// Robot MUST be completely still
+// ======================================================
 void calibrateGyroBias() {
   long sum = 0;
-  const int samples = 1000;
-  for (int i = 0; i < samples; i++) {
+  const int SAMPLES = 2000;
+  Serial.println("Calibrating...");
+  for (int i = 0; i < SAMPLES; i++) {
     int16_t gx, gy, gz;
     Gyro.getRotation(&gx, &gy, &gz);
     sum += gz;
     delay(5);
+    if (i % 500 == 0) {
+      Serial.print("  ");
+      Serial.print((i * 100) / SAMPLES);
+      Serial.println("%");
+    }
   }
-  gzBias = (sum / (float)samples) / 131.0f;
+  gzBias = (sum / (float)SAMPLES) / 131.0f;
   yaw    = 0.0f;
+  Serial.println("  100% done");
 }
