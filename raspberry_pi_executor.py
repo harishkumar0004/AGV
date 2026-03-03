@@ -33,10 +33,10 @@ class ExecutionState(Enum):
 
 class CommandType(Enum):
     """Motion commands."""
-    FORWARD = 'F'      # Move forward 1 cell (50cm)
-    BACKWARD = 'B'     # Move backward 1 cell
-    TURN_LEFT = 'L'    # 90° CCW turn
-    TURN_RIGHT = 'R'   # 90° CW turn
+    FORWARD = 'f'      # Move forward 1 cell (50cm)
+    BACKWARD = 'b'     # Move backward 1 cell
+    TURN_LEFT = 'l'    # 90° CCW turn
+    TURN_RIGHT = 'r'   # 90° CW turn
 
 
 class Heading(Enum):
