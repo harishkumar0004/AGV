@@ -42,7 +42,7 @@ class AGVController:
             sys.exit(1)
 
         self.running = True
-        self.current_command = 's'
+        self.current_command = 's'  # Start with stop command
         self._stop_event = Event()
 
         # Heartbeat interval must be less than Arduino's commandTimeout (600ms)
@@ -54,6 +54,25 @@ class AGVController:
 
         self.heartbeat_thread = Thread(target=self._heartbeat, daemon=True)
         self.heartbeat_thread.start()
+
+        # Quick ping to verify two-way comms
+        self._initial_ping()
+
+    def _initial_ping(self):
+        """Send a ping to confirm Arduino is responding"""
+        try:
+            self.ser.write(b'?')
+            start = time.time()
+            while time.time() - start < 1.0:
+                if self.ser.in_waiting > 0:
+                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                    if line:
+                        print(f"Ping reply: {line}")
+                        return
+                time.sleep(0.05)
+            print("Warning: no ping reply (cmd '?') within 1s")
+        except Exception as e:
+            print(f"Ping error: {e}")
 
     def _read_serial(self):
         """Read and display serial data from Arduino"""
