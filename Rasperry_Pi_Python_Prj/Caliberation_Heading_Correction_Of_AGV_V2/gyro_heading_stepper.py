@@ -1,333 +1,241 @@
 #!/usr/bin/env python3
 """
-AGV Control System for Raspberry Pi
-Controls the AGV via Serial Communication with Arduino
-Commands: f (forward), b (backward), l (left), r (right), s (stop)
-
-Fix: Added heartbeat keep-alive so Arduino doesn't auto-stop.
-Fix: Replaced input()+select combo with reliable readline approach.
-Fix: Safe cleanup on exit.
+AGV Control System v4 - Raspberry Pi
+Clean rewrite: heartbeat only during active movement,
+rotation commands wait for ROT_DONE before accepting next command.
 """
 
 import serial
 import sys
 import time
 import select
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 
 
 class AGVController:
-    def __init__(self, port='/dev/ttyUSB0', baudrate=115200, timeout=0.1):
-        """
-        Initialize AGV Controller
-
-        Args:
-            port: Serial port (default: /dev/ttyUSB0)
-            baudrate: Baud rate (default: 115200)
-            timeout: Serial timeout in seconds
-        """
+    def __init__(self, port='/dev/ttyUSB0', baudrate=115200):
         try:
-            self.ser = serial.Serial(port, baudrate, timeout=timeout)
-            print(f"Connected to {port} at {baudrate} baud")
-            time.sleep(2)  # Wait for Arduino to initialize
-
+            self.ser = serial.Serial(port, baudrate, timeout=0.1)
+            print(f"Connected: {port} @ {baudrate}")
+            time.sleep(2)
             self.ser.flushInput()
             self.ser.flushOutput()
-
         except serial.SerialException as e:
-            print(f"Error: Could not open serial port {port}")
-            print(f"Details: {e}")
-            print("\nAvailable ports:")
-            self.list_ports()
+            print(f"Cannot open {port}: {e}")
+            self._list_ports()
             sys.exit(1)
 
-        self.running = True
-        self.current_command = 's'  # Start with stop command
-        self._stop_event = Event()
+        self.running          = True
+        self.current_cmd      = 's'
+        self.motors_active    = False   # True only when AGV is actually moving
+        self.rotating         = False   # True during l/r command until ROT_DONE
+        self._stop_event      = Event()
+        self._serial_lock     = Lock()
 
-        # Heartbeat interval must be less than Arduino's commandTimeout (600ms)
-        self.heartbeat_interval = 0.2  # 200ms
+        # Heartbeat: only resends command while motors are active
+        # Interval must be < Arduino CMD_TIMEOUT (700ms)
+        self.heartbeat_interval = 0.25  # 250ms
 
-        # Start background threads
-        self.read_thread = Thread(target=self._read_serial, daemon=True)
-        self.read_thread.start()
+        self._read_thread = Thread(target=self._read_serial, daemon=True)
+        self._read_thread.start()
 
-        self.heartbeat_thread = Thread(target=self._heartbeat, daemon=True)
-        self.heartbeat_thread.start()
+        self._hb_thread = Thread(target=self._heartbeat, daemon=True)
+        self._hb_thread.start()
 
-        # Quick ping to verify two-way comms
-        self._initial_ping()
+        # Verify connection
+        time.sleep(0.5)
+        self._ping()
 
-    def _initial_ping(self):
-        """Send a ping to confirm Arduino is responding"""
+    # --------------------------------------------------
+    def _ping(self):
         try:
-            self.ser.write(b'?')
+            with self._serial_lock:
+                self.ser.write(b'?')
             start = time.time()
-            while time.time() - start < 1.0:
-                if self.ser.in_waiting > 0:
-                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
-                    if line:
-                        print(f"Ping reply: {line}")
-                        return
-                time.sleep(0.05)
-            print("Warning: no ping reply (cmd '?') within 1s")
+            while time.time() - start < 2.0:
+                time.sleep(0.1)
+                # response printed by _read_serial thread
+            print("Ping sent — check above for ACK")
         except Exception as e:
             print(f"Ping error: {e}")
 
+    # --------------------------------------------------
     def _read_serial(self):
-        """Read and display serial data from Arduino"""
+        """Background thread: read and print Arduino output."""
         while self.running and not self._stop_event.is_set():
             try:
                 if self.ser.is_open and self.ser.in_waiting > 0:
-                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
-                    if line:
+                    raw = self.ser.readline()
+                    line = raw.decode('utf-8', errors='ignore').strip()
+                    if not line:
+                        continue
+
+                    # Detect rotation complete
+                    if line.startswith("ROT_DONE"):
+                        self.rotating     = False
+                        self.motors_active = False
+                        self.current_cmd  = 's'
+                        print(f"\n[Arduino] {line}  ← rotation complete")
+                    else:
                         print(f"  [Arduino] {line}")
+
             except serial.SerialException:
                 break
             except Exception as e:
                 print(f"Read error: {e}")
-            time.sleep(0.01)
+            time.sleep(0.005)
 
+    # --------------------------------------------------
     def _heartbeat(self):
         """
-        Continuously resend the current command so Arduino doesn't auto-stop.
-        Arduino has a 600ms command timeout; we send every 200ms.
+        Resend current command only while motors are active.
+        This prevents the Arduino CMD_TIMEOUT from stopping the AGV
+        during long forward/backward runs.
+        When stopped or after rotation completes, sends nothing
+        (Arduino is already stopped, no need to keep pinging 's').
         """
         while self.running and not self._stop_event.is_set():
-            try:
-                if self.ser.is_open:
-                    self.ser.write(self.current_command.encode())
-            except serial.SerialException:
-                break
-            except Exception as e:
-                print(f"Heartbeat error: {e}")
+            if self.motors_active:
+                try:
+                    with self._serial_lock:
+                        self.ser.write(self.current_cmd.encode())
+                except Exception as e:
+                    print(f"Heartbeat error: {e}")
             time.sleep(self.heartbeat_interval)
 
-    def send_command(self, cmd, distance=None):
-        """
-        Send command to Arduino.
+    # --------------------------------------------------
+    def send_command(self, cmd):
+        """Send a single-char command to Arduino."""
+        if cmd not in ('f', 'b', 'l', 'r', 's'):
+            print("Invalid command. Use: f b l r s")
+            return False
 
-        Args:
-            cmd: Single character command (f, b, l, r, s)
-            distance: Distance in steps for forward command (optional)
-        """
-        if cmd not in ['f', 'b', 'l', 'r', 's']:
-            print("Invalid command. Use: f (forward), b (backward), l (left), r (right), s (stop)")
+        # Block new movement commands while rotating
+        if self.rotating and cmd in ('f', 'b', 'l', 'r'):
+            print("Busy rotating — wait for ROT_DONE or send 's' to abort")
             return False
 
         try:
-            self.current_command = cmd  # Heartbeat will keep sending this
+            with self._serial_lock:
+                self.ser.write(cmd.encode())
 
-            if cmd == 'f' and distance is not None:
-                # Send distance command: 'd' followed by distance value
-                # Format: d<distance> (e.g., d1000 for 1000 steps)
-                distance_cmd = f"d{int(distance)}\n"
-                self.ser.write(distance_cmd.encode())
-                time.sleep(0.1)  # Small delay before sending movement command
+            self.current_cmd = cmd
 
-            self.ser.write(cmd.encode())
+            if cmd == 's':
+                self.motors_active = False
+                self.rotating      = False
+            elif cmd in ('l', 'r'):
+                self.motors_active = True
+                self.rotating      = True   # wait for ROT_DONE
+            else:
+                self.motors_active = True
+                self.rotating      = False
+
             return True
         except Exception as e:
-            print(f"Error sending command: {e}")
+            print(f"Send error: {e}")
             return False
 
-    def list_ports(self):
-        """List available serial ports"""
-        try:
-            import glob
-            ports = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
-            if ports:
-                for port in ports:
-                    print(f"  {port}")
-            else:
-                print("  No serial ports found")
-        except Exception as e:
-            print(f"  Error listing ports: {e}")
+    # --------------------------------------------------
+    def wait_rotation_done(self, timeout=10.0):
+        """Block until rotation completes or timeout."""
+        start = time.time()
+        while self.rotating:
+            if time.time() - start > timeout:
+                print("Rotation timeout!")
+                return False
+            time.sleep(0.1)
+        return True
 
+    # --------------------------------------------------
+    def _list_ports(self):
+        import glob
+        ports = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
+        print("Available ports:", ports if ports else "none found")
+
+    # --------------------------------------------------
     def close(self):
-        """Close serial connection safely"""
         if not self.running:
-            return  # Already closed
+            return
         self.running = False
         self._stop_event.set()
         try:
             if self.ser.is_open:
-                self.ser.write(b's')  # Stop command before closing
+                self.ser.write(b's')
                 time.sleep(0.2)
                 self.ser.close()
-                print("Connection closed")
+                print("Disconnected")
         except Exception:
             pass
 
 
-def interactive_mode(controller):
-    """Interactive keyboard command mode"""
-    print("\n" + "=" * 50)
-    print("AGV Control System - Interactive Mode")
-    print("=" * 50)
-    print("  f [distance] - Move Forward (optional distance in steps)")
-    print("  b - Turn Backward 180 degrees")
-    print("  l - Turn Left 90 degrees")
-    print("  r - Turn Right 90 degrees")
-    print("  s - Stop")
-    print("  h - Help")
-    print("  q - Quit")
-    print("=" * 50 + "\n")
+# ======================================================
+# INTERACTIVE MODE
+# ======================================================
+def interactive_mode(agv):
+    print("\n" + "=" * 45)
+    print(" AGV Control  v4 — Interactive")
+    print("=" * 45)
+    print("  f  — Forward (hold key, send 's' to stop)")
+    print("  b  — Backward")
+    print("  l  — Turn Left 90°  (auto-stops)")
+    print("  r  — Turn Right 90° (auto-stops)")
+    print("  s  — Stop")
+    print("  q  — Quit")
+    print("=" * 45)
+    print("NOTE: For f/b keep sending the command.")
+    print("      l/r auto-stop when 90° is reached.\n")
 
     try:
-        while controller.running:
-            # Use select for non-blocking stdin check
+        while agv.running:
             ready, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if ready:
-                line = sys.stdin.readline()
-                if not line:  # EOF
-                    break
-                cmd = line.strip().lower()
+            if not ready:
+                continue
 
-                if not cmd:
-                    continue
-                elif cmd == 'q':
-                    print("Exiting...")
-                    break
-                elif cmd == 'h':
-                    print("Commands: f=forward(+distance), b=backward 180°, l=left 90°, r=right 90°, s=stop, q=quit")
-                elif cmd == 's':
-                    if controller.send_command('s'):
-                        print(">> Stop")
-                elif cmd.startswith('f'):
-                    # Parse: 'f' or 'f <distance>'
-                    parts = cmd.split()
-                    distance = None
-                    if len(parts) > 1:
-                        try:
-                            distance = int(parts[1])
-                            if controller.send_command('f', distance=distance):
-                                print(f">> Forward ({distance} steps)")
-                        except ValueError:
-                            print(f"Invalid distance '{parts[1]}'. Use: f [distance in steps]")
-                    else:
-                        if controller.send_command('f'):
-                            print(">> Forward (max distance)")
-                elif cmd in ['b', 'l', 'r']:
-                    if controller.send_command(cmd):
-                        labels = {'b': 'Backward (180°)', 'l': 'Left (90°)', 'r': 'Right (90°)'}
-                        print(f">> {labels[cmd]}")
-                else:
-                    print(f"Unknown command '{cmd}'. Type 'h' for help.")
+            line = sys.stdin.readline()
+            if not line:
+                break
+            cmd = line.strip().lower()
+            if not cmd:
+                continue
+
+            if cmd == 'q':
+                print("Quitting...")
+                break
+            elif cmd in ('f', 'b', 'l', 'r', 's'):
+                if agv.send_command(cmd):
+                    labels = {
+                        'f': 'Forward',
+                        'b': 'Backward',
+                        'l': 'Left 90° (waiting for completion...)',
+                        'r': 'Right 90° (waiting for completion...)',
+                        's': 'Stop'
+                    }
+                    print(f">> {labels[cmd]}")
+            else:
+                print(f"Unknown '{cmd}'. Use f/b/l/r/s/q")
 
     except KeyboardInterrupt:
-        print("\nInterrupted by user")
+        print("\nCtrl+C")
     finally:
-        controller.close()
+        agv.close()
 
 
-def autonomous_mode(controller, sequence):
-    """
-    Execute a sequence of commands.
-
-    Sequence characters:
-      f/b/l/r/s = movement commands
-      p         = pause 1 second
-      0-9       = hold previous command for N seconds
-    """
-    print(f"\nExecuting sequence: {sequence}")
-    print("=" * 50)
-
-    try:
-        i = 0
-        while i < len(sequence):
-            cmd = sequence[i]
-            if cmd == 'p':
-                print("Pause 1s")
-                controller.send_command('s')
-                time.sleep(1)
-            elif cmd.isdigit():
-                duration = int(cmd)
-                print(f"Hold {controller.current_command} for {duration}s")
-                time.sleep(duration)
-            elif cmd in ['f', 'b', 'l', 'r', 's']:
-                controller.send_command(cmd)
-                labels = {'f': 'Forward', 'b': 'Backward', 'l': 'Left', 'r': 'Right', 's': 'Stop'}
-                print(f"CMD: {labels[cmd]}")
-                time.sleep(0.3)  # Short settle time
-            i += 1
-
-        controller.send_command('s')
-        print("Sequence complete")
-    except KeyboardInterrupt:
-        print("\nSequence interrupted")
-        controller.send_command('s')
-    finally:
-        time.sleep(0.5)
-        controller.close()
-
-
-def continuous_mode(controller, command, duration):
-    """Send a command continuously for a specified duration (heartbeat handles resending)"""
-    labels = {'f': 'Forward', 'b': 'Backward', 'l': 'Left', 'r': 'Right', 's': 'Stop'}
-    label = labels.get(command, command)
-    print(f"\nRunning '{label}' for {duration} seconds...")
-    print("=" * 50)
-
-    try:
-        controller.send_command(command)
-        time.sleep(duration)
-    except KeyboardInterrupt:
-        print("\nInterrupted")
-    finally:
-        controller.send_command('s')
-        time.sleep(0.3)
-        controller.close()
-
-
+# ======================================================
+# MAIN
+# ======================================================
 def main():
-    """Main entry point"""
-    print("AGV Control System v2.0")
-    print("========================")
+    print("AGV Control System v4")
+    print("=" * 30)
 
-    if len(sys.argv) > 1:
-        mode = sys.argv[1].lower()
+    port = '/dev/ttyUSB0'
 
-        if mode in ('--help', '-h'):
-            print("\nUsage:")
-            print("  python3 agv_control.py [MODE] [OPTIONS]")
-            print("\nModes:")
-            print("  interactive               - Interactive keyboard control (default)")
-            print("  sequence [cmds]           - Execute command sequence")
-            print("                              Digits 0-9 = hold for N seconds")
-            print("                              p = pause 1 second")
-            print("                              e.g. 'f3l1r1b3s' = forward 3s, left 1s...")
-            print("  continuous [cmd] [secs]   - Run command for N seconds")
-            print("\nSerial Port:")
-            print("  Default: /dev/ttyUSB0")
-            print("  Edit AGVController(port=...) to change")
-            sys.exit(0)
+    # Allow port override: python3 agv.py /dev/ttyACM0
+    if len(sys.argv) > 1 and sys.argv[1].startswith('/dev/'):
+        port = sys.argv[1]
 
-        elif mode == 'sequence' and len(sys.argv) > 2:
-            controller = AGVController()
-            autonomous_mode(controller, sys.argv[2])
-
-        elif mode == 'continuous' and len(sys.argv) > 3:
-            cmd = sys.argv[2].lower()
-            try:
-                duration = float(sys.argv[3])
-                controller = AGVController()
-                continuous_mode(controller, cmd, duration)
-            except ValueError:
-                print("Error: Duration must be a number")
-                sys.exit(1)
-
-        elif mode == 'interactive':
-            controller = AGVController()
-            interactive_mode(controller)
-
-        else:
-            print("Invalid arguments. Use --help for usage.")
-            sys.exit(1)
-
-    else:
-        controller = AGVController()
-        interactive_mode(controller)
+    agv = AGVController(port=port)
+    interactive_mode(agv)
 
 
 if __name__ == '__main__':
