@@ -11,6 +11,7 @@ usb = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
 time.sleep(2)
 
 robot_state = "MOVING"
+usb.write(b'f')
 expected_tag = None
 
 
