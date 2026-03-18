@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-AGV Camera Navigation - Stage 1 with Pivot Rotation
-- Tag 1: Move forward
-- Tag 2: Align to tag angle → 180° pivot → stop
+AGV Camera Navigation - Stage 1 with Pivot Rotation (FIXED)
+- Single window only
+- No memory leaks
+- Prevents multiple instances
 """
 
 import apriltag
@@ -11,6 +12,8 @@ import serial
 import time
 import math
 import numpy as np
+import os
+import signal
 
 # ===== CONFIGURATION =====
 CAMERA_INDEX = 0
@@ -27,6 +30,28 @@ TURN_SENSITIVITY = 100
 # Tags
 TAG_FORWARD = 1
 TAG_ALIGN = 2
+
+# ===== PREVENT MULTIPLE INSTANCES =====
+LOCKFILE = "/tmp/agv_nav.lock"
+
+def check_single_instance():
+    """Ensure only one instance of this script is running"""
+    if os.path.exists(LOCKFILE):
+        print("[ERROR] AGV Navigation already running!")
+        print(f"[ERROR] Delete {LOCKFILE} if stuck, then retry")
+        exit(1)
+    
+    # Create lock file
+    with open(LOCKFILE, 'w') as f:
+        f.write(str(os.getpid()))
+
+def remove_lockfile():
+    """Clean up lock file on exit"""
+    if os.path.exists(LOCKFILE):
+        try:
+            os.remove(LOCKFILE)
+        except:
+            pass
 
 # ===== SERIAL COMMUNICATION =====
 class SerialComm:
@@ -63,7 +88,10 @@ class SerialComm:
     
     def close(self):
         if self.ser:
-            self.ser.close()
+            try:
+                self.ser.close()
+            except:
+                pass
             self.connected = False
 
 # ===== CAMERA =====
@@ -78,9 +106,14 @@ class Camera:
         try:
             print("[CAMERA] Initializing...")
             self.cap = cv2.VideoCapture(self.index)
+            if not self.cap.isOpened():
+                print("[CAMERA] Failed to open camera")
+                return False
+            
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             self.cap.set(cv2.CAP_PROP_FPS, 30)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer
             
             ret, frame = self.cap.read()
             if not ret:
@@ -96,11 +129,18 @@ class Camera:
     def read(self):
         if not self.cap:
             return None, None
-        return self.cap.read()
+        try:
+            ret, frame = self.cap.read()
+            return ret, frame
+        except:
+            return None, None
     
     def close(self):
         if self.cap:
-            self.cap.release()
+            try:
+                self.cap.release()
+            except:
+                pass
 
 # ===== APRILTAG DETECTOR =====
 class Detector:
@@ -130,39 +170,27 @@ class Detector:
             return []
         try:
             return self.detector.detect(gray_frame)
-        except Exception as e:
-            print(f"[DETECTOR] Error: {e}")
+        except:
             return []
 
 # ===== TAG ANGLE EXTRACTION =====
 def get_tag_angle(detection):
-    """
-    Extract tag rotation angle from AprilTag detection
-    
-    Returns angle in degrees (0-360)
-    where 0° = tag facing directly at camera
-    """
-    # Get the tag corners
-    corners = detection['lb-rb-rt-lt']  # Corners in order
-    
-    # Calculate vectors from center to edges
-    center = detection['center']
-    
-    # Vector from center to top-right corner
-    p1 = np.array(corners[2])  # rt (right-top)
-    p2 = np.array(corners[3])  # lt (left-top)
-    
-    # Calculate angle of tag orientation
-    # Angle between vertical and the top edge of tag
-    top_edge = p1 - p2
-    angle_rad = math.atan2(top_edge[1], top_edge[0])
-    angle_deg = math.degrees(angle_rad)
-    
-    # Normalize to 0-360
-    if angle_deg < 0:
-        angle_deg += 360
-    
-    return int(angle_deg)
+    """Extract tag rotation angle from AprilTag detection"""
+    try:
+        corners = detection['lb-rb-rt-lt']
+        p1 = np.array(corners[2])  # rt
+        p2 = np.array(corners[3])  # lt
+        
+        top_edge = p1 - p2
+        angle_rad = math.atan2(top_edge[1], top_edge[0])
+        angle_deg = math.degrees(angle_rad)
+        
+        if angle_deg < 0:
+            angle_deg += 360
+        
+        return int(angle_deg)
+    except:
+        return 0
 
 # ===== NAVIGATION =====
 class Navigator:
@@ -191,7 +219,6 @@ class Navigator:
         print()
         
         if tag_id == TAG_FORWARD:
-            # ===== TAG 1: MOVE FORWARD =====
             if abs(offset) < CENTER_THRESHOLD:
                 print("[NAV] → Tag 1 FORWARD (centered)")
                 self.serial.send('f')
@@ -203,13 +230,10 @@ class Navigator:
             self.last_command_time = current_time
         
         elif tag_id == TAG_ALIGN:
-            # ===== TAG 2: ALIGN & PIVOT =====
             if abs(offset) < CENTER_THRESHOLD:
-                # Tag centered in frame
                 if not self.tag2_align_sent:
-                    # First time: Send alignment command with tag angle
                     if tag_angle is not None:
-                        angle_str = f"a{tag_angle:03d}"  # Format: a045, a090, etc.
+                        angle_str = f"a{tag_angle:03d}"
                         print(f"[NAV] → Tag 2 ALIGN to {tag_angle}°")
                         self.serial.send(angle_str)
                         self.tag2_align_sent = True
@@ -217,7 +241,6 @@ class Navigator:
                         self.state = "ALIGNING"
                         self.pivot_sent = False
                 
-                # After 3 seconds, send pivot command
                 elif (current_time - self.tag2_align_start_time) >= 3.0:
                     if not self.pivot_sent:
                         print("[NAV] → Tag 2 PIVOT 180°")
@@ -240,52 +263,62 @@ class Navigator:
 
 # ===== VISUALIZATION =====
 def draw_overlay(frame, tag_id, offset, angle):
-    # Center line
-    cv2.line(frame, (FRAME_CENTER, 0), (FRAME_CENTER, FRAME_HEIGHT),
-            (0, 255, 255), 2)
-    
-    # Title
-    cv2.putText(frame, "Tag 1: Forward | Tag 2: Align → Pivot 180°", (10, 30),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    
-    if tag_id:
-        status = f"Tag {tag_id} | Offset: {offset}px"
-        if angle is not None:
-            status += f" | Angle: {angle}°"
-        color = (0, 255, 0) if tag_id == TAG_FORWARD else (0, 165, 255)
-    else:
-        status = "Waiting for tag..."
-        color = (0, 165, 255)
-    
-    cv2.putText(frame, status, (10, 70),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-    
-    return frame
+    """Draw overlay on frame"""
+    try:
+        # Center line
+        cv2.line(frame, (FRAME_CENTER, 0), (FRAME_CENTER, FRAME_HEIGHT),
+                (0, 255, 255), 2)
+        
+        # Title
+        cv2.putText(frame, "Tag 1: Forward | Tag 2: Align → Pivot 180°", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        if tag_id:
+            status = f"Tag {tag_id} | Offset: {offset}px"
+            if angle is not None:
+                status += f" | Angle: {angle}°"
+            color = (0, 255, 0) if tag_id == TAG_FORWARD else (0, 165, 255)
+        else:
+            status = "Waiting for tag..."
+            color = (0, 165, 255)
+        
+        cv2.putText(frame, status, (10, 70),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        
+        return frame
+    except:
+        return frame
 
 # ===== MAIN =====
 def main():
     print("\n" + "="*70)
-    print("AGV STAGE 1 - Pivot 180° Rotation with Tag Angle Alignment")
+    print("AGV STAGE 1 - Pivot 180° Rotation (SINGLE WINDOW)")
     print("="*70)
     print("Behavior:")
     print("  Tag 1: Move forward")
     print("  Tag 2: Detect tag angle → Align → Pivot 180° in place → Stop")
     print("="*70 + "\n")
     
+    # Check single instance
+    check_single_instance()
+    
     # Initialize
     serial_comm = SerialComm(SERIAL_PORT, BAUD_RATE)
     if not serial_comm.connect():
+        remove_lockfile()
         return
     
     camera = Camera(CAMERA_INDEX, FRAME_WIDTH, FRAME_HEIGHT)
     if not camera.initialize():
         serial_comm.close()
+        remove_lockfile()
         return
     
     detector = Detector()
     if not detector.initialize():
         camera.close()
         serial_comm.close()
+        remove_lockfile()
         return
     
     navigator = Navigator(serial_comm)
@@ -294,12 +327,14 @@ def main():
     print("="*70 + "\n")
     
     frame_count = 0
+    window_name = "AGV Navigation - Pivot 180°"  # SINGLE WINDOW NAME
     
     try:
-        while camera.cap.isOpened():
+        while camera.cap and camera.cap.isOpened():
             ret, frame = camera.read()
-            if not ret:
-                break
+            if not ret or frame is None:
+                time.sleep(0.01)
+                continue
             
             frame_count += 1
             
@@ -328,14 +363,11 @@ def main():
                     # Draw offset line
                     cv2.line(frame, (FRAME_CENTER, cy), (cx, cy), (255, 0, 0), 2)
                     
-                    # Get offset
+                    # Get offset and angle
                     offset = navigator.get_offset(det)
                     
-                    # Get tag angle (especially for Tag 2)
                     if tag_id == TAG_ALIGN:
                         tag_angle = get_tag_angle(det)
-                        
-                        # Draw angle indicator
                         angle_text = f"Angle: {tag_angle}°"
                         cv2.putText(frame, angle_text, (cx-50, cy+30),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
@@ -352,25 +384,53 @@ def main():
             # Draw overlay
             frame = draw_overlay(frame, tag_id, offset, tag_angle)
             
-            # Display
-            cv2.imshow('AGV Navigation - Pivot 180°', frame)
+            # Display in SINGLE window (reused, not creating new ones)
+            cv2.imshow(window_name, frame)
             
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            # Check for quit
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("\n[USER] Quit requested")
                 break
     
     except KeyboardInterrupt:
-        print("\n[USER] Quit")
+        print("\n[USER] Interrupted")
+    
+    except Exception as e:
+        print(f"\n[ERROR] {e}")
     
     finally:
-        print("\n[CLEANUP] Stopping...")
+        print("\n[CLEANUP] Stopping motors...")
         serial_comm.send('s')
         time.sleep(0.5)
         
+        print("[CLEANUP] Closing resources...")
+        
+        # Close camera properly
         camera.close()
+        
+        # Close serial properly
         serial_comm.close()
+        
+        # Close ALL OpenCV windows
         cv2.destroyAllWindows()
+        
+        # Clean up lock file
+        remove_lockfile()
         
         print("[CLEANUP] Complete\n")
 
+# ===== SIGNAL HANDLERS =====
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully"""
+    print("\n[SIGNAL] Caught interrupt")
+    raise KeyboardInterrupt
+
+# ===== ENTRY POINT =====
 if __name__ == "__main__":
-    main()
+    signal.signal(signal.SIGINT, signal_handler)
+    try:
+        main()
+    except:
+        remove_lockfile()
+        cv2.destroyAllWindows()
