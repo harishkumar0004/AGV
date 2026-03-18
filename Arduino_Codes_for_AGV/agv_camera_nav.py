@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-AGV Camera-Based Navigation - STAGE 1
-Clean, simple implementation for:
-1. Tag 1 detected → Move forward
-2. Tag 2 detected → Adjust position → 180° turn
-
-No unnecessary debug output - only command flow
+AGV Camera Navigation - Stage 1 with Pivot Rotation
+- Tag 1: Move forward
+- Tag 2: Align to tag angle → 180° pivot → stop
 """
 
 import apriltag
 import cv2
 import serial
 import time
+import math
+import numpy as np
 
 # ===== CONFIGURATION =====
 CAMERA_INDEX = 0
@@ -21,13 +20,13 @@ FRAME_CENTER = FRAME_WIDTH // 2
 BAUD_RATE = 9600
 SERIAL_PORT = "/dev/ttyUSB0"
 
-# Navigation parameters
-CENTER_THRESHOLD = 40      # ±40px from center
-TURN_SENSITIVITY = 100     # When to turn
+# Navigation
+CENTER_THRESHOLD = 40
+TURN_SENSITIVITY = 100
 
 # Tags
 TAG_FORWARD = 1
-TAG_ADJUST = 2
+TAG_ALIGN = 2
 
 # ===== SERIAL COMMUNICATION =====
 class SerialComm:
@@ -38,9 +37,8 @@ class SerialComm:
         self.connected = False
         
     def connect(self):
-        """Connect to Arduino"""
         try:
-            print(f"[SERIAL] Connecting to {self.port} @ {self.baudrate} baud...")
+            print(f"[SERIAL] Connecting to {self.port}...")
             self.ser = serial.Serial(self.port, self.baudrate, timeout=1)
             time.sleep(2)
             self.ser.reset_input_buffer()
@@ -52,18 +50,15 @@ class SerialComm:
             return False
     
     def send(self, cmd):
-        """Send command and show what was sent"""
         if not self.connected:
-            print("[SERIAL] Not connected!")
             return False
-        
         try:
             print(f">>> COMMAND SENT: '{cmd}'")
             self.ser.write(cmd.encode())
             time.sleep(0.05)
             return True
         except Exception as e:
-            print(f"[ERROR] Failed to send: {e}")
+            print(f"[ERROR] {e}")
             return False
     
     def close(self):
@@ -71,7 +66,7 @@ class SerialComm:
             self.ser.close()
             self.connected = False
 
-# ===== CAMERA SETUP =====
+# ===== CAMERA =====
 class Camera:
     def __init__(self, index, width, height):
         self.index = index
@@ -81,7 +76,7 @@ class Camera:
         
     def initialize(self):
         try:
-            print(f"[CAMERA] Initializing...")
+            print("[CAMERA] Initializing...")
             self.cap = cv2.VideoCapture(self.index)
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
@@ -92,7 +87,7 @@ class Camera:
                 print("[CAMERA] Failed to read")
                 return False
             
-            print(f"[CAMERA] ✓ Ready ({self.width}x{self.height})\n")
+            print(f"[CAMERA] ✓ Ready\n")
             return True
         except Exception as e:
             print(f"[CAMERA] Error: {e}")
@@ -139,95 +134,124 @@ class Detector:
             print(f"[DETECTOR] Error: {e}")
             return []
 
-# ===== NAVIGATION LOGIC =====
+# ===== TAG ANGLE EXTRACTION =====
+def get_tag_angle(detection):
+    """
+    Extract tag rotation angle from AprilTag detection
+    
+    Returns angle in degrees (0-360)
+    where 0° = tag facing directly at camera
+    """
+    # Get the tag corners
+    corners = detection['lb-rb-rt-lt']  # Corners in order
+    
+    # Calculate vectors from center to edges
+    center = detection['center']
+    
+    # Vector from center to top-right corner
+    p1 = np.array(corners[2])  # rt (right-top)
+    p2 = np.array(corners[3])  # lt (left-top)
+    
+    # Calculate angle of tag orientation
+    # Angle between vertical and the top edge of tag
+    top_edge = p1 - p2
+    angle_rad = math.atan2(top_edge[1], top_edge[0])
+    angle_deg = math.degrees(angle_rad)
+    
+    # Normalize to 0-360
+    if angle_deg < 0:
+        angle_deg += 360
+    
+    return int(angle_deg)
+
+# ===== NAVIGATION =====
 class Navigator:
     def __init__(self, serial_comm):
         self.serial = serial_comm
         self.last_command_time = 0
-        self.command_interval = 0.3  # seconds
-        self.current_state = "STOPPED"
-        self.tag2_detected_time = 0
-        self.turn_initiated = False
+        self.command_interval = 0.3
+        self.state = "STOPPED"
+        self.tag2_align_sent = False
+        self.tag2_align_start_time = 0
+        self.pivot_sent = False
         
     def get_offset(self, detection):
-        """Get horizontal offset from frame center"""
         cx = int(detection['center'][0])
         return cx - FRAME_CENTER
     
-    def navigate(self, tag_id, offset):
-        """Navigate based on tag detection"""
+    def navigate(self, tag_id, offset, tag_angle=None):
         current_time = time.time()
         
-        # Rate limit commands
         if (current_time - self.last_command_time) < self.command_interval:
             return
         
-        print(f"\n[NAV] Tag {tag_id} detected | Offset: {offset}px")
+        print(f"\n[NAV] Tag {tag_id} detected | Offset: {offset}px", end="")
+        if tag_angle is not None:
+            print(f" | Angle: {tag_angle}°", end="")
+        print()
         
         if tag_id == TAG_FORWARD:
             # ===== TAG 1: MOVE FORWARD =====
             if abs(offset) < CENTER_THRESHOLD:
-                # Tag centered → move forward
-                print("[NAV] → FORWARD (tag centered)")
+                print("[NAV] → Tag 1 FORWARD (centered)")
                 self.serial.send('f')
-                self.current_state = "FORWARD"
-                
-            elif offset < -TURN_SENSITIVITY:
-                # Tag left → turn left to center
-                print("[NAV] → FORWARD (correcting left)")
-                self.serial.send('f')
-                
-            elif offset > TURN_SENSITIVITY:
-                # Tag right → turn right to center
-                print("[NAV] → FORWARD (correcting right)")
+                self.state = "FORWARD"
+            else:
+                print("[NAV] → Tag 1 FORWARD (correcting)")
                 self.serial.send('f')
             
             self.last_command_time = current_time
         
-        elif tag_id == TAG_ADJUST:
-            # ===== TAG 2: ADJUST POSITION → 180° TURN =====
+        elif tag_id == TAG_ALIGN:
+            # ===== TAG 2: ALIGN & PIVOT =====
             if abs(offset) < CENTER_THRESHOLD:
-                # Tag centered → start adjustment phase
-                if self.current_state != "ADJUSTING":
-                    print("[NAV] → ADJUST (tag centered)")
-                    self.serial.send('a')  # Send adjust command
-                    self.current_state = "ADJUSTING"
-                    self.tag2_detected_time = current_time
-                    self.turn_initiated = False
+                # Tag centered in frame
+                if not self.tag2_align_sent:
+                    # First time: Send alignment command with tag angle
+                    if tag_angle is not None:
+                        angle_str = f"a{tag_angle:03d}"  # Format: a045, a090, etc.
+                        print(f"[NAV] → Tag 2 ALIGN to {tag_angle}°")
+                        self.serial.send(angle_str)
+                        self.tag2_align_sent = True
+                        self.tag2_align_start_time = current_time
+                        self.state = "ALIGNING"
+                        self.pivot_sent = False
                 
-                # After 2 seconds, initiate 180° turn
-                elif (current_time - self.tag2_detected_time) >= 2.0:
-                    if not self.turn_initiated:
-                        print("[NAV] → TURN 180°")
-                        self.serial.send('t')  # Send turn command
-                        self.turn_initiated = True
-                        self.current_state = "TURNING"
+                # After 3 seconds, send pivot command
+                elif (current_time - self.tag2_align_start_time) >= 3.0:
+                    if not self.pivot_sent:
+                        print("[NAV] → Tag 2 PIVOT 180°")
+                        self.serial.send('p')
+                        self.pivot_sent = True
+                        self.state = "PIVOTING"
             
             self.last_command_time = current_time
     
     def no_tag(self):
-        """Handle no tag detected"""
         current_time = time.time()
         if (current_time - self.last_command_time) > self.command_interval:
-            if self.current_state != "STOPPED":
+            if self.state != "STOPPED":
                 print("[NAV] No tag → STOP")
                 self.serial.send('s')
-                self.current_state = "STOPPED"
+                self.state = "STOPPED"
+                self.tag2_align_sent = False
+                self.pivot_sent = False
             self.last_command_time = current_time
 
 # ===== VISUALIZATION =====
-def draw_overlay(frame, tag_id, offset):
-    """Draw minimal overlay on frame"""
+def draw_overlay(frame, tag_id, offset, angle):
     # Center line
     cv2.line(frame, (FRAME_CENTER, 0), (FRAME_CENTER, FRAME_HEIGHT),
             (0, 255, 255), 2)
     
     # Title
-    cv2.putText(frame, "AGV Stage 1: Forward -> Adjust -> 180°", (10, 30),
+    cv2.putText(frame, "Tag 1: Forward | Tag 2: Align → Pivot 180°", (10, 30),
                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     
     if tag_id:
         status = f"Tag {tag_id} | Offset: {offset}px"
+        if angle is not None:
+            status += f" | Angle: {angle}°"
         color = (0, 255, 0) if tag_id == TAG_FORWARD else (0, 165, 255)
     else:
         status = "Waiting for tag..."
@@ -240,13 +264,13 @@ def draw_overlay(frame, tag_id, offset):
 
 # ===== MAIN =====
 def main():
-    print("\n" + "="*60)
-    print("AGV STAGE 1 - Clean Command-Based Navigation")
-    print("="*60)
+    print("\n" + "="*70)
+    print("AGV STAGE 1 - Pivot 180° Rotation with Tag Angle Alignment")
+    print("="*70)
     print("Behavior:")
     print("  Tag 1: Move forward")
-    print("  Tag 2: Adjust position → 180° turn")
-    print("="*60 + "\n")
+    print("  Tag 2: Detect tag angle → Align → Pivot 180° in place → Stop")
+    print("="*70 + "\n")
     
     # Initialize
     serial_comm = SerialComm(SERIAL_PORT, BAUD_RATE)
@@ -266,8 +290,8 @@ def main():
     
     navigator = Navigator(serial_comm)
     
-    print("[READY] System initialized and ready\n")
-    print("="*60 + "\n")
+    print("[READY] System initialized\n")
+    print("="*70 + "\n")
     
     frame_count = 0
     
@@ -285,12 +309,13 @@ def main():
             
             tag_id = None
             offset = None
+            tag_angle = None
             
             if detections:
                 det = detections[0]
                 tag_id = det['id']
                 
-                if tag_id in [TAG_FORWARD, TAG_ADJUST]:
+                if tag_id in [TAG_FORWARD, TAG_ALIGN]:
                     # Draw tag
                     pts = det['lb-rb-rt-lt'].astype(int)
                     color = (0, 255, 0) if tag_id == TAG_FORWARD else (0, 165, 255)
@@ -303,30 +328,41 @@ def main():
                     # Draw offset line
                     cv2.line(frame, (FRAME_CENTER, cy), (cx, cy), (255, 0, 0), 2)
                     
+                    # Get offset
+                    offset = navigator.get_offset(det)
+                    
+                    # Get tag angle (especially for Tag 2)
+                    if tag_id == TAG_ALIGN:
+                        tag_angle = get_tag_angle(det)
+                        
+                        # Draw angle indicator
+                        angle_text = f"Angle: {tag_angle}°"
+                        cv2.putText(frame, angle_text, (cx-50, cy+30),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    
                     # Tag label
                     cv2.putText(frame, f"ID:{tag_id}", (cx-20, cy-30),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                     
                     # Navigate
-                    offset = navigator.get_offset(det)
-                    navigator.navigate(tag_id, offset)
+                    navigator.navigate(tag_id, offset, tag_angle)
             else:
                 navigator.no_tag()
             
             # Draw overlay
-            frame = draw_overlay(frame, tag_id, offset)
+            frame = draw_overlay(frame, tag_id, offset, tag_angle)
             
             # Display
-            cv2.imshow('AGV Stage 1', frame)
+            cv2.imshow('AGV Navigation - Pivot 180°', frame)
             
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
     
     except KeyboardInterrupt:
-        print("\n[USER] Quit requested")
+        print("\n[USER] Quit")
     
     finally:
-        print("\n[CLEANUP] Stopping motors...")
+        print("\n[CLEANUP] Stopping...")
         serial_comm.send('s')
         time.sleep(0.5)
         
