@@ -17,14 +17,14 @@ SERIAL_PORT = "/dev/ttyUSB0"
 TAG_START = 1
 TAG_TURN = 2
 FORWARD_REFRESH_INTERVAL = 1.0
-PIVOT_DURATION_SECONDS = 4.0
-PIVOT_SETTLE_SECONDS = 0.2
+PIVOT_ACK_TIMEOUT_SECONDS = 20.0
 
 # ===== GLOBAL STATE =====
 running = True
 camera = None
 detector = None
 serial_conn = None
+serial_rx_buffer = ""
 
 # ===== FUNCTIONS =====
 def send_command(cmd):
@@ -36,9 +36,36 @@ def send_command(cmd):
         except:
             pass
 
+def read_serial_messages():
+    """Read complete lines from Arduino without blocking the video loop."""
+    global serial_rx_buffer
+
+    messages = []
+
+    if not serial_conn or not serial_conn.is_open:
+        return messages
+
+    try:
+        waiting = serial_conn.in_waiting
+        if waiting <= 0:
+            return messages
+
+        serial_rx_buffer += serial_conn.read(waiting).decode(errors="ignore")
+
+        while "\n" in serial_rx_buffer:
+            line, serial_rx_buffer = serial_rx_buffer.split("\n", 1)
+            line = line.strip()
+            if line:
+                print(f"<<< {line}")
+                messages.append(line)
+    except:
+        pass
+
+    return messages
+
 def initialize():
     """Initialize all systems"""
-    global camera, detector, serial_conn
+    global camera, detector, serial_conn, serial_rx_buffer
     
     print("\n[INIT] Starting AGV Navigation...\n")
     
@@ -47,6 +74,8 @@ def initialize():
         print("[SERIAL] Connecting...")
         serial_conn = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
         time.sleep(2)
+        serial_conn.reset_input_buffer()
+        serial_rx_buffer = ""
         send_command('s')
         print("[SERIAL] ✓ Ready\n")
     except Exception as e:
@@ -134,7 +163,7 @@ def main():
     # Stage 1 state tracking
     stage_state = "WAITING_FOR_TAG_1"
     last_forward_command_time = 0.0
-    pivot_start_time = 0.0
+    pivot_command_time = 0.0
     
     print("Press 'q' to quit\n")
     
@@ -149,6 +178,8 @@ def main():
             # Detect tags
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             detections = detector.detect(gray)
+            serial_messages = read_serial_messages()
+            pivot_done = any("EVENT:PIVOT_DONE" in msg for msg in serial_messages)
             
             current_time = time.time()
             visible_tag_ids = set()
@@ -194,9 +225,9 @@ def main():
             elif stage_state == "MOVING_TO_TAG_2":
                 if TAG_TURN in visible_tag_ids:
                     send_command('p')
-                    pivot_start_time = current_time
-                    stage_state = "TURNING_180"
-                    status = "Tag 2 detected -> Turning 180"
+                    pivot_command_time = current_time
+                    stage_state = "WAITING_FOR_PIVOT_DONE"
+                    status = "Tag 2 detected -> Stop and pivot by steps"
                 elif current_time - last_forward_command_time >= FORWARD_REFRESH_INTERVAL:
                     send_command('f')
                     last_forward_command_time = current_time
@@ -204,20 +235,16 @@ def main():
                 else:
                     status = "Moving forward until Tag 2 is detected"
 
-            elif stage_state == "TURNING_180":
-                elapsed = current_time - pivot_start_time
-                total_turn_time = PIVOT_SETTLE_SECONDS + PIVOT_DURATION_SECONDS
-                remaining = max(0.0, total_turn_time - elapsed)
-
-                if elapsed < PIVOT_SETTLE_SECONDS:
-                    status = "Tag 2 detected -> Stopping at current position"
-                else:
-                    status = f"Turning 180... {remaining:.1f}s remaining"
-
-                if elapsed >= total_turn_time:
+            elif stage_state == "WAITING_FOR_PIVOT_DONE":
+                if pivot_done:
+                    stage_state = "STAGE_1_COMPLETE"
+                    status = "Stage 1 complete -> Pivot finished and AGV stopped"
+                elif current_time - pivot_command_time >= PIVOT_ACK_TIMEOUT_SECONDS:
                     send_command('s')
                     stage_state = "STAGE_1_COMPLETE"
-                    status = "Stage 1 complete -> AGV stopped"
+                    status = "Pivot event timeout -> Sent safety stop"
+                else:
+                    status = "Waiting for Mega to finish the 180 pivot"
 
             else:
                 status = "Stage 1 complete. Press q to exit."
