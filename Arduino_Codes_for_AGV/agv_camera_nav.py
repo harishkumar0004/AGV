@@ -18,6 +18,7 @@ TAG_START = 1
 TAG_TURN = 2
 FORWARD_REFRESH_INTERVAL = 1.0
 PIVOT_DURATION_SECONDS = 4.0
+PIVOT_SETTLE_SECONDS = 0.2
 
 # ===== GLOBAL STATE =====
 running = True
@@ -205,10 +206,15 @@ def main():
 
             elif stage_state == "TURNING_180":
                 elapsed = current_time - pivot_start_time
-                remaining = max(0.0, PIVOT_DURATION_SECONDS - elapsed)
-                status = f"Turning 180... {remaining:.1f}s remaining"
+                total_turn_time = PIVOT_SETTLE_SECONDS + PIVOT_DURATION_SECONDS
+                remaining = max(0.0, total_turn_time - elapsed)
 
-                if elapsed >= PIVOT_DURATION_SECONDS:
+                if elapsed < PIVOT_SETTLE_SECONDS:
+                    status = "Tag 2 detected -> Stopping at current position"
+                else:
+                    status = f"Turning 180... {remaining:.1f}s remaining"
+
+                if elapsed >= total_turn_time:
                     send_command('s')
                     stage_state = "STAGE_1_COMPLETE"
                     status = "Stage 1 complete -> AGV stopped"
