@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-AGV Camera-Based Navigation with AprilTags
-COMPLETE DEBUG VERSION - All processes logged
+AGV Camera-Based Navigation - STAGE 1
+Clean, simple implementation for:
+1. Tag 1 detected → Move forward
+2. Tag 2 detected → Adjust position → 180° turn
+
+No unnecessary debug output - only command flow
 """
 
 import apriltag
 import cv2
 import serial
 import time
-import sys
 
 # ===== CONFIGURATION =====
 CAMERA_INDEX = 0
@@ -18,34 +21,13 @@ FRAME_CENTER = FRAME_WIDTH // 2
 BAUD_RATE = 9600
 SERIAL_PORT = "/dev/ttyUSB0"
 
-# Navigation tuning (in pixels)
-CENTER_THRESHOLD = 40
-TURN_SENSITIVITY = 100
+# Navigation parameters
+CENTER_THRESHOLD = 40      # ±40px from center
+TURN_SENSITIVITY = 100     # When to turn
 
 # Tags
 TAG_FORWARD = 1
-TAG_TURN = 2
-
-# Debug flags
-DEBUG = True
-DEBUG_SERIAL = True
-DEBUG_CAMERA = True
-DEBUG_NAVIGATION = True
-
-def debug_print(module, message, level="INFO"):
-    """Print debug message with timestamp and module"""
-    timestamp = time.strftime("%H:%M:%S")
-    color_map = {
-        "INFO": "\033[92m",      # Green
-        "WARNING": "\033[93m",   # Yellow
-        "ERROR": "\033[91m",     # Red
-        "DEBUG": "\033[94m"      # Blue
-    }
-    reset = "\033[0m"
-    color = color_map.get(level, reset)
-    
-    if DEBUG:
-        print(f"{color}[{timestamp}] [{module}] {message}{reset}")
+TAG_ADJUST = 2
 
 # ===== SERIAL COMMUNICATION =====
 class SerialComm:
@@ -54,137 +36,85 @@ class SerialComm:
         self.baudrate = baudrate
         self.ser = None
         self.connected = False
-        self.commands_sent = 0
-        self.last_command = None
         
     def connect(self):
-        """Establish serial connection"""
+        """Connect to Arduino"""
         try:
-            debug_print("SERIAL", f"Attempting to connect on {self.port} @ {self.baudrate} baud...", "DEBUG")
+            print(f"[SERIAL] Connecting to {self.port} @ {self.baudrate} baud...")
             self.ser = serial.Serial(self.port, self.baudrate, timeout=1)
             time.sleep(2)
-            
-            # Clear any garbage data
             self.ser.reset_input_buffer()
-            self.ser.reset_output_buffer()
-            
             self.connected = True
-            debug_print("SERIAL", f"✓ Connected successfully", "INFO")
-            debug_print("SERIAL", f"Port: {self.port} | Baud: {self.baudrate} | Timeout: 1s", "DEBUG")
+            print(f"[SERIAL] ✓ Connected\n")
             return True
-            
-        except serial.SerialException as e:
-            debug_print("SERIAL", f"✗ Connection failed: {e}", "ERROR")
-            debug_print("SERIAL", "Try: ls /dev/tty* to find available ports", "WARNING")
+        except Exception as e:
+            print(f"[SERIAL] ✗ Failed: {e}")
             return False
     
     def send(self, cmd):
-        """Send command to Arduino"""
+        """Send command and show what was sent"""
         if not self.connected:
-            debug_print("SERIAL", "Not connected, cannot send command", "ERROR")
+            print("[SERIAL] Not connected!")
             return False
         
         try:
-            # Send command
-            cmd_bytes = cmd.encode()
-            debug_print("SERIAL", f"Sending: '{cmd}' (bytes: {cmd_bytes})", "DEBUG")
-            
-            self.ser.write(cmd_bytes)
-            self.commands_sent += 1
-            self.last_command = cmd
+            print(f">>> COMMAND SENT: '{cmd}'")
+            self.ser.write(cmd.encode())
             time.sleep(0.05)
-            
-            # Try to read response
-            response = ""
-            if self.ser.in_waiting:
-                try:
-                    response = self.ser.readline().decode().strip()
-                    debug_print("SERIAL", f"Arduino response: {response}", "DEBUG")
-                except Exception as e:
-                    debug_print("SERIAL", f"Error reading response: {e}", "WARNING")
-            else:
-                debug_print("SERIAL", "No response from Arduino", "WARNING")
-            
             return True
-            
         except Exception as e:
-            debug_print("SERIAL", f"Error sending command: {e}", "ERROR")
+            print(f"[ERROR] Failed to send: {e}")
             return False
     
-    def status(self):
-        """Print connection status"""
-        debug_print("SERIAL", f"Status: {'Connected' if self.connected else 'Disconnected'}", "INFO")
-        debug_print("SERIAL", f"Commands sent: {self.commands_sent}", "DEBUG")
-        debug_print("SERIAL", f"Last command: {self.last_command}", "DEBUG")
-    
     def close(self):
-        """Close serial connection"""
         if self.ser:
             self.ser.close()
             self.connected = False
-            debug_print("SERIAL", "Connection closed", "INFO")
 
-# ===== CAMERA =====
+# ===== CAMERA SETUP =====
 class Camera:
     def __init__(self, index, width, height):
         self.index = index
         self.width = width
         self.height = height
         self.cap = None
-        self.frame_count = 0
         
     def initialize(self):
-        """Initialize camera"""
         try:
-            debug_print("CAMERA", f"Initializing camera {self.index}...", "DEBUG")
+            print(f"[CAMERA] Initializing...")
             self.cap = cv2.VideoCapture(self.index)
-            
-            # Set resolution
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             self.cap.set(cv2.CAP_PROP_FPS, 30)
             
-            # Try to read one frame
             ret, frame = self.cap.read()
             if not ret:
-                debug_print("CAMERA", "Failed to read frame", "ERROR")
+                print("[CAMERA] Failed to read")
                 return False
             
-            debug_print("CAMERA", "✓ Camera initialized successfully", "INFO")
-            debug_print("CAMERA", f"Resolution: {self.width}x{self.height} @ 30 FPS", "DEBUG")
+            print(f"[CAMERA] ✓ Ready ({self.width}x{self.height})\n")
             return True
-            
         except Exception as e:
-            debug_print("CAMERA", f"Error initializing camera: {e}", "ERROR")
+            print(f"[CAMERA] Error: {e}")
             return False
     
     def read(self):
-        """Read frame from camera"""
         if not self.cap:
-            debug_print("CAMERA", "Camera not initialized", "ERROR")
             return None, None
-        
-        ret, frame = self.cap.read()
-        if ret:
-            self.frame_count += 1
-        return ret, frame
+        return self.cap.read()
     
     def close(self):
-        """Close camera"""
         if self.cap:
             self.cap.release()
-            debug_print("CAMERA", "Camera closed", "INFO")
 
 # ===== APRILTAG DETECTOR =====
-class AprilTagDetector:
+class Detector:
     def __init__(self):
         self.detector = None
-        self.detections_count = 0
         
     def initialize(self):
-        """Initialize detector"""
         try:
-            debug_print("DETECTOR", "Initializing AprilTag detector...", "DEBUG")
+            print("[DETECTOR] Initializing AprilTag...")
             self.detector = apriltag.apriltag(
                 family='tag36h11',
                 threads=4,
@@ -194,182 +124,157 @@ class AprilTagDetector:
                 refine_edges=True,
                 debug=False
             )
-            debug_print("DETECTOR", "✓ AprilTag detector initialized", "INFO")
-            debug_print("DETECTOR", "Family: tag36h11 | Threads: 4 | Decimate: 2.0", "DEBUG")
+            print("[DETECTOR] ✓ Ready\n")
             return True
         except Exception as e:
-            debug_print("DETECTOR", f"Error: {e}", "ERROR")
+            print(f"[DETECTOR] Error: {e}")
             return False
     
     def detect(self, gray_frame):
-        """Detect tags in frame"""
         if not self.detector:
-            debug_print("DETECTOR", "Detector not initialized", "ERROR")
             return []
-        
         try:
-            detections = self.detector.detect(gray_frame)
-            if detections:
-                self.detections_count += 1
-                if DEBUG_CAMERA:
-                    debug_print("DETECTOR", f"Found {len(detections)} tag(s)", "INFO")
-                    for det in detections:
-                        debug_print("DETECTOR", f"  Tag ID: {det['id']} | Center: ({int(det['center'][0])}, {int(det['center'][1])})", "DEBUG")
-            return detections
+            return self.detector.detect(gray_frame)
         except Exception as e:
-            debug_print("DETECTOR", f"Detection error: {e}", "ERROR")
+            print(f"[DETECTOR] Error: {e}")
             return []
 
-# ===== NAVIGATION =====
+# ===== NAVIGATION LOGIC =====
 class Navigator:
     def __init__(self, serial_comm):
         self.serial = serial_comm
-        self.last_navigation_time = 0
-        self.navigation_interval = 0.3  # seconds
-        self.navigation_count = 0
+        self.last_command_time = 0
+        self.command_interval = 0.3  # seconds
+        self.current_state = "STOPPED"
+        self.tag2_detected_time = 0
+        self.turn_initiated = False
         
-    def get_tag_offset(self, detection):
-        """Calculate horizontal offset from frame center"""
-        center_x = int(detection['center'][0])
-        offset = center_x - FRAME_CENTER
-        return offset
+    def get_offset(self, detection):
+        """Get horizontal offset from frame center"""
+        cx = int(detection['center'][0])
+        return cx - FRAME_CENTER
     
     def navigate(self, tag_id, offset):
-        """Decide movement based on tag"""
+        """Navigate based on tag detection"""
         current_time = time.time()
         
-        # Rate limit navigation commands
-        if (current_time - self.last_navigation_time) < self.navigation_interval:
-            return None
+        # Rate limit commands
+        if (current_time - self.last_command_time) < self.command_interval:
+            return
         
-        self.last_navigation_time = current_time
-        self.navigation_count += 1
-        
-        if DEBUG_NAVIGATION:
-            debug_print("NAV", f"[{self.navigation_count}] Tag {tag_id} detected | Offset: {offset}px", "INFO")
-        
-        decision = None
-        command = None
+        print(f"\n[NAV] Tag {tag_id} detected | Offset: {offset}px")
         
         if tag_id == TAG_FORWARD:
-            # Move forward with centering
+            # ===== TAG 1: MOVE FORWARD =====
             if abs(offset) < CENTER_THRESHOLD:
-                decision = "FORWARD (centered)"
-                command = 'f'
+                # Tag centered → move forward
+                print("[NAV] → FORWARD (tag centered)")
+                self.serial.send('f')
+                self.current_state = "FORWARD"
+                
             elif offset < -TURN_SENSITIVITY:
-                decision = f"TURN LEFT (offset: {offset})"
-                command = 'l'
+                # Tag left → turn left to center
+                print("[NAV] → FORWARD (correcting left)")
+                self.serial.send('f')
+                
             elif offset > TURN_SENSITIVITY:
-                decision = f"TURN RIGHT (offset: {offset})"
-                command = 'r'
-            else:
-                decision = f"FORWARD (correcting)"
-                command = 'f'
-        
-        elif tag_id == TAG_TURN:
-            # Turn decision based on position
-            if offset < -50:
-                decision = f"TURN LEFT (tag at {offset})"
-                command = 'l'
-            elif offset > 50:
-                decision = f"TURN RIGHT (tag at {offset})"
-                command = 'r'
-            else:
-                decision = "STOP (tag centered)"
-                command = 's'
-        
-        if command:
-            if DEBUG_NAVIGATION:
-                debug_print("NAV", f"Decision: {decision}", "INFO")
-                debug_print("NAV", f"Sending command: '{command}'", "DEBUG")
+                # Tag right → turn right to center
+                print("[NAV] → FORWARD (correcting right)")
+                self.serial.send('f')
             
-            self.serial.send(command)
+            self.last_command_time = current_time
         
-        return decision
+        elif tag_id == TAG_ADJUST:
+            # ===== TAG 2: ADJUST POSITION → 180° TURN =====
+            if abs(offset) < CENTER_THRESHOLD:
+                # Tag centered → start adjustment phase
+                if self.current_state != "ADJUSTING":
+                    print("[NAV] → ADJUST (tag centered)")
+                    self.serial.send('a')  # Send adjust command
+                    self.current_state = "ADJUSTING"
+                    self.tag2_detected_time = current_time
+                    self.turn_initiated = False
+                
+                # After 2 seconds, initiate 180° turn
+                elif (current_time - self.tag2_detected_time) >= 2.0:
+                    if not self.turn_initiated:
+                        print("[NAV] → TURN 180°")
+                        self.serial.send('t')  # Send turn command
+                        self.turn_initiated = True
+                        self.current_state = "TURNING"
+            
+            self.last_command_time = current_time
     
-    def no_tag_detected(self):
+    def no_tag(self):
         """Handle no tag detected"""
         current_time = time.time()
-        if (current_time - self.last_navigation_time) > self.navigation_interval:
-            debug_print("NAV", "No tags detected - STOP", "WARNING")
-            self.serial.send('s')
-            self.last_navigation_time = current_time
+        if (current_time - self.last_command_time) > self.command_interval:
+            if self.current_state != "STOPPED":
+                print("[NAV] No tag → STOP")
+                self.serial.send('s')
+                self.current_state = "STOPPED"
+            self.last_command_time = current_time
 
 # ===== VISUALIZATION =====
-def draw_debug_info(frame, tag_id, offset, decision):
-    """Draw debug overlay on frame"""
-    # Frame center line
-    cv2.line(frame, (FRAME_CENTER, 0), (FRAME_CENTER, FRAME_HEIGHT), 
+def draw_overlay(frame, tag_id, offset):
+    """Draw minimal overlay on frame"""
+    # Center line
+    cv2.line(frame, (FRAME_CENTER, 0), (FRAME_CENTER, FRAME_HEIGHT),
             (0, 255, 255), 2)
     
-    # Header
-    cv2.putText(frame, "AGV Navigation [DEBUG]", (10, 30),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-    
-    # Status
-    if decision:
-        cv2.putText(frame, f"Decision: {decision}", (10, 70),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    else:
-        cv2.putText(frame, "Waiting for tag...", (10, 70),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+    # Title
+    cv2.putText(frame, "AGV Stage 1: Forward -> Adjust -> 180°", (10, 30),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     
     if tag_id:
-        cv2.putText(frame, f"Tag {tag_id} | Offset: {offset}px", (10, 110),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+        status = f"Tag {tag_id} | Offset: {offset}px"
+        color = (0, 255, 0) if tag_id == TAG_FORWARD else (0, 165, 255)
+    else:
+        status = "Waiting for tag..."
+        color = (0, 165, 255)
+    
+    cv2.putText(frame, status, (10, 70),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
     
     return frame
 
 # ===== MAIN =====
 def main():
-    """Main navigation loop"""
-    print("\n" + "="*70)
-    print(" "*15 + "AGV CAMERA-BASED NAVIGATION [DEBUG VERSION]")
-    print("="*70 + "\n")
+    print("\n" + "="*60)
+    print("AGV STAGE 1 - Clean Command-Based Navigation")
+    print("="*60)
+    print("Behavior:")
+    print("  Tag 1: Move forward")
+    print("  Tag 2: Adjust position → 180° turn")
+    print("="*60 + "\n")
     
-    # Initialize serial
-    debug_print("MAIN", "Starting AGV Navigation System...", "INFO")
+    # Initialize
     serial_comm = SerialComm(SERIAL_PORT, BAUD_RATE)
-    
     if not serial_comm.connect():
-        debug_print("MAIN", "Fatal: Cannot connect to Arduino", "ERROR")
         return
     
-    # Initialize camera
     camera = Camera(CAMERA_INDEX, FRAME_WIDTH, FRAME_HEIGHT)
     if not camera.initialize():
-        debug_print("MAIN", "Fatal: Cannot initialize camera", "ERROR")
         serial_comm.close()
         return
     
-    # Initialize detector
-    detector = AprilTagDetector()
+    detector = Detector()
     if not detector.initialize():
-        debug_print("MAIN", "Fatal: Cannot initialize detector", "ERROR")
         camera.close()
         serial_comm.close()
         return
     
-    # Initialize navigator
     navigator = Navigator(serial_comm)
     
-    debug_print("MAIN", "All systems ready!", "INFO")
-    print("\n" + "-"*70)
-    print("Configuration:")
-    print(f"  Tag {TAG_FORWARD}: Move forward")
-    print(f"  Tag {TAG_TURN}: Turn decision")
-    print(f"  Center threshold: {CENTER_THRESHOLD}px")
-    print(f"  Turn sensitivity: {TURN_SENSITIVITY}px")
-    print("-"*70 + "\n")
+    print("[READY] System initialized and ready\n")
+    print("="*60 + "\n")
+    
+    frame_count = 0
     
     try:
-        frame_count = 0
-        
         while camera.cap.isOpened():
-            # Read frame
             ret, frame = camera.read()
             if not ret:
-                debug_print("MAIN", "Cannot read frame", "ERROR")
                 break
             
             frame_count += 1
@@ -378,16 +283,14 @@ def main():
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             detections = detector.detect(gray)
             
-            # Process
             tag_id = None
             offset = None
-            decision = None
             
             if detections:
                 det = detections[0]
                 tag_id = det['id']
                 
-                if tag_id in [TAG_FORWARD, TAG_TURN]:
+                if tag_id in [TAG_FORWARD, TAG_ADJUST]:
                     # Draw tag
                     pts = det['lb-rb-rt-lt'].astype(int)
                     color = (0, 255, 0) if tag_id == TAG_FORWARD else (0, 165, 255)
@@ -405,45 +308,33 @@ def main():
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                     
                     # Navigate
-                    offset = navigator.get_tag_offset(det)
-                    decision = navigator.navigate(tag_id, offset)
-                else:
-                    debug_print("MAIN", f"Tag ID {tag_id} not in navigation list", "WARNING")
+                    offset = navigator.get_offset(det)
+                    navigator.navigate(tag_id, offset)
             else:
-                navigator.no_tag_detected()
+                navigator.no_tag()
             
-            # Draw debug overlay
-            frame = draw_debug_info(frame, tag_id, offset, decision)
+            # Draw overlay
+            frame = draw_overlay(frame, tag_id, offset)
             
             # Display
-            cv2.imshow('AGV Navigation [DEBUG]', frame)
+            cv2.imshow('AGV Stage 1', frame)
             
-            # Exit on 'q'
             if cv2.waitKey(1) & 0xFF == ord('q'):
-                debug_print("MAIN", "Quit requested by user", "INFO")
                 break
     
     except KeyboardInterrupt:
-        debug_print("MAIN", "Interrupted by user", "WARNING")
-    
-    except Exception as e:
-        debug_print("MAIN", f"Unexpected error: {e}", "ERROR")
-        import traceback
-        traceback.print_exc()
+        print("\n[USER] Quit requested")
     
     finally:
-        # Cleanup
-        debug_print("MAIN", "Cleaning up...", "INFO")
-        serial_comm.send('s')  # Stop motors
+        print("\n[CLEANUP] Stopping motors...")
+        serial_comm.send('s')
         time.sleep(0.5)
         
         camera.close()
-        serial_comm.status()
         serial_comm.close()
         cv2.destroyAllWindows()
         
-        debug_print("MAIN", "Shutdown complete", "INFO")
-        print("\n" + "="*70 + "\n")
+        print("[CLEANUP] Complete\n")
 
 if __name__ == "__main__":
     main()
