@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""
-Stage 1 AGV Navigation using AprilTags on Raspberry Pi
-Master sends commands to Arduino (Slave) via Serial
-Reads feedback from Arduino and adjusts navigation accordingly
-"""
+"""AGV navigation using AprilTags with proper Arduino handshaking"""
 
 import apriltag
 import cv2
 import serial
 import time
-import threading
 
 # ===== CONFIG =====
 CAMERA_INDEX = 0
@@ -17,14 +12,13 @@ FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 FRAME_CENTER = FRAME_WIDTH // 2
 
-# IMPORTANT: Arduino code uses 115200 baud, not 9600
-BAUD_RATE = 115200
+BAUD_RATE = 115200   # MUST match Arduino
 SERIAL_PORT = "/dev/ttyUSB0"
 
 TAG_START = 1
 TAG_TURN = 2
-FORWARD_REFRESH_INTERVAL = 1.0
-PIVOT_ACK_TIMEOUT_SECONDS = 30.0
+
+PIVOT_ACK_TIMEOUT_SECONDS = 20.0
 
 # ===== GLOBAL STATE =====
 running = True
@@ -32,33 +26,22 @@ camera = None
 detector = None
 serial_conn = None
 serial_rx_buffer = ""
-serial_lock = threading.Lock()
+last_event = None
 
-# Arduino Status
-arduino_status = {
-    "ready": False,
-    "state": "UNKNOWN",
-    "speed_rpm": 0.0,
-    "last_event": None,
-    "event_time": 0.0
-}
-
-# ===== FUNCTIONS =====
+# ===== SERIAL =====
 def send_command(cmd):
-    """Send command to Arduino (Slave)"""
-    global serial_conn
-    
+    """Send command to Arduino with newline"""
     if serial_conn and serial_conn.is_open:
         try:
-            with serial_lock:
-                serial_conn.write((cmd + '\n').encode())
-                print(f">>> CMD: '{cmd}'")
-        except Exception as e:
-            print(f"[ERROR] Failed to send command: {e}")
+            serial_conn.write((cmd + '\n').encode())
+            print(f">>> CMD: {cmd}")
+        except:
+            pass
+
 
 def read_serial_messages():
-    """Read complete lines from Arduino without blocking the video loop."""
-    global serial_rx_buffer, arduino_status
+    """Read messages and capture events"""
+    global serial_rx_buffer, last_event
 
     messages = []
 
@@ -66,295 +49,197 @@ def read_serial_messages():
         return messages
 
     try:
-        with serial_lock:
-            waiting = serial_conn.in_waiting
-            if waiting <= 0:
-                return messages
+        if serial_conn.in_waiting > 0:
+            serial_rx_buffer += serial_conn.read(serial_conn.in_waiting).decode(errors="ignore")
 
-            serial_rx_buffer += serial_conn.read(waiting).decode(errors="ignore")
+            while "\n" in serial_rx_buffer:
+                line, serial_rx_buffer = serial_rx_buffer.split("\n", 1)
+                line = line.strip()
 
-        while "\n" in serial_rx_buffer:
-            line, serial_rx_buffer = serial_rx_buffer.split("\n", 1)
-            line = line.strip()
-            if line:
-                print(f"<<< {line}")
-                messages.append(line)
-                
-                # Parse Arduino feedback
-                if line.startswith("READY:"):
-                    arduino_status["ready"] = True
-                    print("[MASTER] Arduino is ready (Slave connected)")
-                
-                elif line.startswith("EVENT:"):
-                    event = line.replace("EVENT:", "")
-                    arduino_status["last_event"] = event
-                    arduino_status["event_time"] = time.time()
-                
-                elif line.startswith("STATUS:"):
-                    # Parse status message from Arduino
-                    status_parts = line.replace("STATUS:", "").split("|")
-                    for part in status_parts:
-                        if "state=" in part:
-                            arduino_status["state"] = part.split("=")[1]
-                        elif "speed=" in part:
-                            speed_str = part.split("=")[1].replace("rpm", "").strip()
-                            arduino_status["speed_rpm"] = float(speed_str)
-    except Exception as e:
-        print(f"[ERROR] Serial read error: {e}")
+                if line:
+                    print(f"<<< {line}")
+                    messages.append(line)
+
+                    if line.startswith("EVENT:"):
+                        last_event = line
+
+    except:
+        pass
 
     return messages
 
+
+# ===== INIT =====
 def initialize():
-    """Initialize all systems"""
-    global camera, detector, serial_conn, serial_rx_buffer, arduino_status
-    
-    print("\n" + "="*60)
-    print("[MASTER] AGV Navigation - Master Mode")
-    print("Python: Master (Raspberry Pi)")
-    print("Arduino: Slave (Motor Controller)")
-    print("="*60 + "\n")
-    
-    # Serial Connection
+    global camera, detector, serial_conn, serial_rx_buffer
+
+    print("\n[INIT] Starting...\n")
+
+    # SERIAL
     try:
-        print("[SERIAL] Connecting to Arduino Slave...")
         serial_conn = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-        time.sleep(2)  # Wait for Arduino to reset
+        time.sleep(2)
         serial_conn.reset_input_buffer()
-        serial_rx_buffer = ""
-        
-        # Wait for Arduino READY message
-        start_time = time.time()
-        while not arduino_status["ready"] and time.time() - start_time < 5:
-            read_serial_messages()
-            time.sleep(0.1)
-        
-        if not arduino_status["ready"]:
-            print("[SERIAL] ✗ Arduino did not respond")
-            return False
-        
-        print("[SERIAL] ✓ Connected to Arduino Slave\n")
-        
-        # Send initial stop command
         send_command('s')
-        time.sleep(0.5)
-        
+        print("[SERIAL] Ready")
     except Exception as e:
-        print(f"[SERIAL] ✗ Failed: {e}\n")
+        print(f"[SERIAL ERROR] {e}")
         return False
-    
-    # Camera
+
+    # CAMERA
     try:
-        print("[CAMERA] Opening...")
         camera = cv2.VideoCapture(CAMERA_INDEX)
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-        camera.set(cv2.CAP_PROP_FPS, 30)
-        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        
+
         ret, _ = camera.read()
         if not ret:
-            raise Exception("Can't read from camera")
-        
-        print("[CAMERA] ✓ Ready\n")
+            raise Exception("Camera failed")
+
+        print("[CAMERA] Ready")
     except Exception as e:
-        print(f"[CAMERA] ✗ Failed: {e}\n")
+        print(f"[CAMERA ERROR] {e}")
         return False
-    
-    # Detector
-    try:
-        print("[DETECTOR] Initializing...")
-        detector = apriltag.apriltag(
-            family='tag36h11',
-            threads=4,
-            maxhamming=1,
-            decimate=2.0,
-            blur=0.0,
-            refine_edges=True,
-            debug=False
-        )
-        print("[DETECTOR] ✓ Ready\n")
-        print("[READY] All systems initialized\n")
-    except Exception as e:
-        print(f"[DETECTOR] ✗ Failed: {e}\n")
-        return False
-    
+
+    # APRILTAG
+    detector = apriltag.apriltag()
+
+    print("[READY]\n")
     return True
 
-def cleanup():
-    """Clean up and exit"""
-    global running, camera, serial_conn
-    
-    print("\n" + "="*60)
-    print("[CLEANUP] Shutting down Master...")
-    print("="*60 + "\n")
-    
-    running = False
-    
-    # Stop motors (tell Slave to stop)
-    if serial_conn and serial_conn.is_open:
-        try:
-            send_command('s')
-            time.sleep(0.5)
-            serial_conn.close()
-            print("[CLEANUP] Serial connection closed")
-        except:
-            pass
-    
-    # Close camera
-    if camera:
-        try:
-            camera.release()
-        except:
-            pass
-    
-    # Close all windows
-    cv2.destroyAllWindows()
-    
-    print("[CLEANUP] ✓ Done\n")
 
-# ===== MAIN LOOP =====
+# ===== CLEANUP =====
+def cleanup():
+    global running
+
+    print("\n[CLEANUP]")
+
+    running = False
+
+    if serial_conn and serial_conn.is_open:
+        send_command('s')
+        time.sleep(0.2)
+        serial_conn.close()
+
+    if camera:
+        camera.release()
+
+    cv2.destroyAllWindows()
+
+
+# ===== MAIN =====
 def main():
-    """Main loop - Master control logic"""
-    global running, camera, detector, arduino_status
-    
+    global running, last_event
+
     if not initialize():
         return
-    
-    window_name = "AGV Navigation - Master Control"
-    
-    # Stage 1 state tracking
+
     stage_state = "WAITING_FOR_TAG_1"
-    last_forward_command_time = 0.0
-    pivot_command_time = 0.0
-    
-    print("Press 'q' to quit\n")
-    print("="*60)
-    print("STAGE 1 Navigation Logic:")
-    print("  1. Wait for Tag 1 → Send FORWARD to Slave")
-    print("  2. Detect Tag 2 → Send PIVOT to Slave")
-    print("  3. Wait for PIVOT_DONE event from Slave → Complete")
-    print("="*60 + "\n")
-    
+    pivot_command_time = 0
+
+    window_name = "AGV"
+
     try:
         while running:
-            # Read frame
+
             ret, frame = camera.read()
             if not ret:
-                time.sleep(0.01)
                 continue
-            
-            # Detect tags
+
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             detections = detector.detect(gray)
-            
-            # Read all pending serial messages from Arduino
-            serial_messages = read_serial_messages()
-            
-            # Check for completion events from Slave
-            pivot_done = any("PIVOT_DONE" in msg for msg in serial_messages)
-            motion_complete = any("MOTION_COMPLETE" in msg for msg in serial_messages)
-            
-            current_time = time.time()
+
+            read_serial_messages()
+
             visible_tag_ids = set()
-            status = ""
-            
+
             # Draw center line
-            cv2.line(frame, (FRAME_CENTER, 0), (FRAME_CENTER, FRAME_HEIGHT), (0, 255, 255), 2)
-            
-            # Draw title
-            cv2.putText(frame, "Master: Stage 1 | Tag1: Forward | Tag2: Pivot+Stop", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            # Draw Slave status
-            slave_status_text = f"Slave: {arduino_status['state']} | Speed: {arduino_status['speed_rpm']:.1f} RPM"
-            cv2.putText(frame, slave_status_text, (10, 450),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-            
-            # Draw detections
-            if detections:
-                for det in detections:
-                    tag_id = det['id']
-                    if tag_id not in [TAG_START, TAG_TURN]:
-                        continue
+            cv2.line(frame, (FRAME_CENTER, 0), (FRAME_CENTER, FRAME_HEIGHT), (0,255,255), 2)
 
-                    visible_tag_ids.add(tag_id)
-                    pts = det['lb-rb-rt-lt'].astype(int)
-                    color = (0, 255, 0) if tag_id == TAG_START else (0, 165, 255)
-                    cv2.polylines(frame, [pts], True, color, 3)
+            # ===== DETECTION =====
+            for det in detections:
+                tag_id = det.tag_id
 
-                    cx, cy = int(det['center'][0]), int(det['center'][1])
-                    cv2.circle(frame, (cx, cy), 8, (0, 0, 255), -1)
-                    cv2.line(frame, (FRAME_CENTER, cy), (cx, cy), (255, 0, 0), 2)
-                    offset = cx - FRAME_CENTER
+                if tag_id not in [TAG_START, TAG_TURN]:
+                    continue
 
-                    tag_name = "START" if tag_id == TAG_START else "TURN"
-                    cv2.putText(frame, f"{tag_name}(ID:{tag_id}) | Offset:{offset}px", (cx - 70, cy - 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                visible_tag_ids.add(tag_id)
 
-            # ===== STAGE 1 STATE MACHINE (MASTER) =====
+                pts = det.corners.astype(int)
+                color = (0,255,0) if tag_id == TAG_START else (0,165,255)
+                cv2.polylines(frame, [pts], True, color, 2)
+
+            # ===== STATE MACHINE =====
+
             if stage_state == "WAITING_FOR_TAG_1":
+
                 if TAG_START in visible_tag_ids:
-                    send_command('f')  # Tell Slave to move forward
-                    last_forward_command_time = current_time
+                    send_command('f')
                     stage_state = "MOVING_TO_TAG_2"
-                    status = "[MASTER] Tag 1 detected → Sent FORWARD to Slave"
+                    status = "Tag1 → Forward"
+
                 else:
-                    status = "[MASTER] Waiting for Tag 1 to start"
+                    status = "Waiting Tag1"
+
 
             elif stage_state == "MOVING_TO_TAG_2":
+
                 if TAG_TURN in visible_tag_ids:
-                    send_command('p')  # Tell Slave to pivot
-                    pivot_command_time = current_time
+                    send_command('p')
+                    pivot_command_time = time.time()
                     stage_state = "WAITING_FOR_PIVOT_DONE"
-                    status = "[MASTER] Tag 2 detected → Sent PIVOT to Slave"
-                    
-                elif current_time - last_forward_command_time >= FORWARD_REFRESH_INTERVAL:
-                    # Periodically send forward to ensure motion continues
-                    send_command('f')
-                    last_forward_command_time = current_time
-                    status = "[MASTER] Refreshing FORWARD command"
+                    status = "Tag2 → Pivot"
+
                 else:
-                    status = "[MASTER] Moving forward, waiting for Tag 2"
+                    status = "Moving forward..."
+
 
             elif stage_state == "WAITING_FOR_PIVOT_DONE":
-                if pivot_done:
-                    # Slave finished pivot
-                    send_command('s')  # Safety stop
-                    stage_state = "STAGE_1_COMPLETE"
-                    status = "[MASTER] Received PIVOT_DONE from Slave → STAGE 1 COMPLETE"
-                    
-                elif current_time - pivot_command_time >= PIVOT_ACK_TIMEOUT_SECONDS:
-                    # Timeout waiting for pivot completion
-                    send_command('s')  # Emergency stop
-                    stage_state = "STAGE_1_COMPLETE"
-                    status = "[MASTER] Pivot timeout → Sent STOP to Slave (safety)"
-                else:
-                    elapsed = current_time - pivot_command_time
-                    status = f"[MASTER] Waiting for Slave to complete pivot ({elapsed:.1f}s / {PIVOT_ACK_TIMEOUT_SECONDS}s timeout)"
 
-            else:  # STAGE_1_COMPLETE
-                status = "[MASTER] Stage 1 complete. Press 'q' to exit."
+                if last_event == "EVENT:PIVOT_DONE":
+                    send_command('f')
+                    stage_state = "RETURNING_TO_TAG_1"
+                    status = "Pivot done → Return"
+
+                elif time.time() - pivot_command_time > PIVOT_ACK_TIMEOUT_SECONDS:
+                    send_command('s')
+                    stage_state = "FINAL_STOP"
+                    status = "Timeout Stop"
+
+                else:
+                    status = "Waiting pivot finish"
+
+
+            elif stage_state == "RETURNING_TO_TAG_1":
+
+                if TAG_START in visible_tag_ids:
+                    send_command('s')
+                    stage_state = "FINAL_STOP"
+                    status = "Reached Tag1 → STOP"
+
+                else:
+                    status = "Returning..."
+
+
+            else:
+                status = "DONE"
+
 
             # Display status
-            cv2.putText(frame, status, (10, 70),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            
-            # Display window
+            cv2.putText(frame, status, (10,30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+
             cv2.imshow(window_name, frame)
-            
-            # Check for quit
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-    
+
     except KeyboardInterrupt:
-        print("\n[MASTER] Interrupted by user")
-    
-    except Exception as e:
-        print(f"\n[ERROR] {e}")
-    
+        pass
+
     finally:
         cleanup()
+
 
 if __name__ == "__main__":
     main()
