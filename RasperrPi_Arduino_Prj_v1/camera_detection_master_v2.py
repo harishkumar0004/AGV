@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AGV Navigation using AprilTag + Arduino (Robust Version)"""
+"""AGV Navigation using AprilTag + Arduino (Final Stable Version)"""
 
 import cv2
 import serial
@@ -13,7 +13,7 @@ FRAME_HEIGHT = 480
 FRAME_CENTER = FRAME_WIDTH // 2
 
 SERIAL_PORT = "/dev/ttyUSB0"
-BAUD_RATE = 115200   # MUST match Arduino
+BAUD_RATE = 115200
 
 TAG_START = 1
 TAG_TURN = 2
@@ -31,7 +31,6 @@ last_event = None
 
 # ===== SERIAL =====
 def send_command(cmd):
-    """Send command with newline"""
     try:
         serial_conn.write((cmd + "\n").encode())
         print(f">>> {cmd}")
@@ -90,7 +89,7 @@ def initialize():
         print("Camera Error:", e)
         return False
 
-    # APRILTAG (FIXED)
+    # APRILTAG (works for your installed version)
     try:
         detector = apriltag.apriltag("tag36h11")
         print("[APRILTAG] OK")
@@ -121,6 +120,19 @@ def cleanup():
     cv2.destroyAllWindows()
 
 
+# ===== DETECTION COMPATIBILITY =====
+def get_tag_info(det):
+    """Handle both dict-style and object-style apriltag"""
+    if isinstance(det, dict):
+        tag_id = det['id']
+        corners = det['lb-rb-rt-lt']
+    else:
+        tag_id = det.tag_id
+        corners = det.corners
+
+    return tag_id, corners.astype(int)
+
+
 # ===== MAIN =====
 def main():
     global running, last_event
@@ -144,19 +156,18 @@ def main():
 
         visible_tags = set()
 
-        # Draw center line
+        # Center line
         cv2.line(frame, (FRAME_CENTER, 0), (FRAME_CENTER, FRAME_HEIGHT), (0,255,255), 2)
 
         # ===== DETECT TAGS =====
         for det in detections:
-            tag_id = det.tag_id
+            tag_id, pts = get_tag_info(det)
 
             if tag_id not in [TAG_START, TAG_TURN]:
                 continue
 
             visible_tags.add(tag_id)
 
-            pts = det.corners.astype(int)
             color = (0,255,0) if tag_id == TAG_START else (0,165,255)
             cv2.polylines(frame, [pts], True, color, 2)
 
@@ -166,7 +177,7 @@ def main():
             if TAG_START in visible_tags:
                 send_command('f')
                 state = "GO_TAG2"
-                status = "Tag1 -> Forward"
+                status = "Tag1 → Forward"
             else:
                 status = "Waiting Tag1"
 
@@ -175,7 +186,7 @@ def main():
                 send_command('p')
                 pivot_time = time.time()
                 state = "WAIT_PIVOT"
-                status = "Tag2 -> Pivot"
+                status = "Tag2 → Pivot"
             else:
                 status = "Moving forward..."
 
@@ -183,7 +194,7 @@ def main():
             if last_event == "EVENT:PIVOT_DONE":
                 send_command('f')
                 state = "RETURN_TAG1"
-                status = "Pivot done -> Return"
+                status = "Pivot done → Return"
             elif time.time() - pivot_time > PIVOT_TIMEOUT:
                 send_command('s')
                 state = "STOP"
@@ -195,14 +206,14 @@ def main():
             if TAG_START in visible_tags:
                 send_command('s')
                 state = "STOP"
-                status = "Reached Tag1 -> STOP"
+                status = "Reached Tag1 → STOP"
             else:
                 status = "Returning..."
 
         else:
             status = "DONE"
 
-        # Display
+        # ===== DISPLAY =====
         cv2.putText(frame, status, (10,30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
 
