@@ -391,9 +391,10 @@ class AGVPathPlannerApp(QMainWindow):
         self.continuous_executor.on_execution_complete = self.on_executor_complete
         self.continuous_executor.on_error = self.show_error_dialog
 
+        self.camera_preview_interval_ms = max(80, int(os.getenv("AGV_PREVIEW_INTERVAL_MS", "125")))
         self.camera_preview_timer = QTimer(self)
         self.camera_preview_timer.timeout.connect(self.refresh_camera_preview)
-        self.camera_preview_timer.start(100)
+        self.camera_preview_timer.start(self.camera_preview_interval_ms)
         QTimer.singleShot(0, self.start_camera_preview)
         
         # Keep backward compatibility
@@ -555,92 +556,6 @@ class AGVPathPlannerApp(QMainWindow):
         )
         return False
     
-    def _confirm_start_tag_detected(self, start_tag_id: int, timeout_sec: float = 5.0) -> bool:
-        """Require a new live detection of the selected start tag before motion begins."""
-        if not getattr(self.continuous_executor, 'use_detector', False):
-            warning = (
-                "AprilTag start confirmation requires the camera detector to be enabled.\n\n"
-                f"Selected start tag: {start_tag_id}"
-            )
-            self.commands_text.setText(f"❌ {warning}")
-            QMessageBox.warning(self, "Start Tag Required", warning)
-            return False
-
-        self.commands_text.setText(
-            f"📷 Waiting for live start tag {start_tag_id} before motion...\n"
-            f"After pressing Start Mission, place Tag {start_tag_id} clearly in the camera view.\n"
-        )
-        QApplication.processEvents()
-
-        if not self.continuous_executor.ensure_detector_running(wait=True, timeout_sec=timeout_sec):
-            warning = (
-                "AprilTag camera is not ready.\n\n"
-                f"Place the AGV on Tag {start_tag_id} and make sure the live preview is running."
-            )
-            self.commands_text.setText(f"❌ {warning}")
-            QMessageBox.warning(self, "Start Tag Required", warning)
-            return False
-
-        detector = getattr(self.continuous_executor, 'detector', None)
-        if detector is None:
-            warning = "AprilTag detector is unavailable."
-            self.commands_text.setText(f"❌ {warning}")
-            QMessageBox.warning(self, "Start Tag Required", warning)
-            return False
-
-        if hasattr(detector, 'reset_detection_cache'):
-            detector.reset_detection_cache()
-
-        max_age_sec = float(getattr(self.continuous_executor, '_max_detection_age_sec', 0.75))
-        deadline = time.time() + timeout_sec
-        wait_started_at = time.time()
-        stable_reads = 0
-        last_timestamp = None
-
-        while time.time() < deadline:
-            QApplication.processEvents()
-            detections = detector.get_last_detection_details()
-            measurement = detections.get(start_tag_id)
-
-            if measurement is not None:
-                timestamp = float(measurement.get('timestamp', 0.0))
-                age_sec = time.time() - timestamp
-                if timestamp >= wait_started_at and age_sec <= max_age_sec:
-                    if timestamp != last_timestamp:
-                        stable_reads += 1
-                        last_timestamp = timestamp
-                    if stable_reads >= 2:
-                        self.robot_state.set_position_from_tag(start_tag_id)
-                        coord = node_id_to_grid_coord(start_tag_id, COLS)
-                        self.canvas.show_robot_at(coord)
-                        self.commands_text.setText(
-                            f"✅ Live start tag {start_tag_id} detected.\n"
-                            "Mission starting..."
-                        )
-                        return True
-                else:
-                    stable_reads = 0
-                    last_timestamp = None
-            else:
-                stable_reads = 0
-                last_timestamp = None
-
-            remaining_sec = max(0.0, deadline - time.time())
-            self.commands_text.setText(
-                f"📷 Waiting for live start tag {start_tag_id} before motion...\n"
-                f"After pressing Start Mission, place Tag {start_tag_id} clearly in the camera view.\n"
-                f"Need 2 fresh frames. Time left: {remaining_sec:.1f}s"
-            )
-            time.sleep(0.05)
-
-        warning = (
-            f"Live start tag {start_tag_id} was not detected after Start Mission.\n\n"
-            f"Place Tag {start_tag_id} in front of the camera and try again."
-        )
-        self.commands_text.setText(f"❌ {warning}")
-        QMessageBox.warning(self, "Start Tag Required", warning)
-        return False
-
     def show_error_dialog(self, error_msg: str):
         """Show error popup."""
         self.commands_text.setText(f"❌ Execution Error\n{error_msg}")
@@ -684,7 +599,7 @@ class AGVPathPlannerApp(QMainWindow):
         scaled_pixmap = pixmap.scaled(
             self.camera_feed_label.size(),
             Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
+            Qt.FastTransformation,
         )
         self.camera_feed_label.setText("")
         self.camera_feed_label.setPixmap(scaled_pixmap)
@@ -1467,9 +1382,6 @@ class AGVPathPlannerApp(QMainWindow):
 
         pickup_id = grid_coord_to_node_id(self.start_coord[0], self.start_coord[1], COLS)
         drop_id = grid_coord_to_node_id(self.goal_coord[0], self.goal_coord[1], COLS)
-
-        if not self._confirm_start_tag_detected(pickup_id):
-            return
 
         if not self._ensure_arduino_connection(
             f"🚀 Starting Mission\n"

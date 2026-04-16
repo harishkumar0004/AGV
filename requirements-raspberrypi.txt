@@ -1,0 +1,8 @@
+# Raspberry Pi is more reliable with the OS packages for Qt and OpenCV.
+# Create the venv with --system-site-packages so `python3-pyqt5` and
+# `python3-opencv` installed by apt are visible inside the venv.
+numpy<2
+apriltag
+matplotlib
+networkx
+pyserial
