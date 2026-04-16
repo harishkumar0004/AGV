@@ -12,7 +12,8 @@ class MissionController:
         self.phase = None
         self.pickup_coord = None
         self.drop_coord = None
-        self.robot_executor.on_execution_complete = self._on_phase_complete
+        self._external_execution_complete = getattr(self.robot_executor, "on_execution_complete", None)
+        self.robot_executor.on_execution_complete = self._on_execution_complete
         self.on_phase_changed = None
         self.on_active_path_changed = None
 
@@ -41,7 +42,7 @@ class MissionController:
         if start_coord == goal_coord:
             current_node_id = grid_coord_to_node_id(start_coord[0], start_coord[1], COLS)
             self.robot_state.update_node(current_node_id)
-            self._on_phase_complete()
+            self._on_execution_complete()
             return
 
         if not path_coords:
@@ -53,9 +54,22 @@ class MissionController:
         path_node_ids = [grid_coord_to_node_id(r, c, COLS) for r, c in path_coords]
         if self.on_active_path_changed:
             self.on_active_path_changed(path_coords)
-        self.robot_executor.execute_path_on_real_robot(path_coords, path_node_ids)
 
-    def _on_phase_complete(self):
+        if not self._ensure_executor_ready():
+            self.robot_state.set_status("ERROR")
+            self.phase = "ERROR"
+            self._emit_phase()
+            return
+
+        self.robot_state.set_status("MOVING")
+
+        # Use new continuous executor interface
+        if not self.robot_executor.execute_path_continuous(path_coords, path_node_ids, direction='F'):
+            self.robot_state.set_status("ERROR")
+            self.phase = "ERROR"
+            self._emit_phase()
+
+    def _on_execution_complete(self, *args, **kwargs):
         if self.phase == "TO_PICKUP":
             self.phase = "TO_DROP"
             self._emit_phase()
@@ -64,6 +78,8 @@ class MissionController:
             self.phase = None
             self.robot_state.set_status("IDLE")
             self._emit_phase("IDLE")
+            if callable(self._external_execution_complete):
+                self._external_execution_complete(*args, **kwargs)
 
     def _emit_phase(self, override=None):
         if self.on_phase_changed:
@@ -76,6 +92,19 @@ class MissionController:
                 if selected[0] == start_coord and selected[-1] == goal_coord:
                     return selected
         return self.planner(start_coord, goal_coord)
+
+    def _ensure_executor_ready(self):
+        """Connect hardware executor on demand before starting a mission phase."""
+        is_connected = getattr(self.robot_executor, "is_connected", None)
+        if callable(is_connected) and is_connected():
+            return True
+
+        connect = getattr(self.robot_executor, "connect", None)
+        if callable(connect):
+            self.robot_state.set_status("CONNECTING")
+            return bool(connect())
+
+        return True
 
     def stop_mission(self):
         self.robot_executor.stop_execution()

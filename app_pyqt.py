@@ -1,9 +1,12 @@
 import os
 import sys
+import time
+from typing import List, Tuple
+import cv2
 from PyQt5.QtCore import Qt, QSize, pyqtSignal, QTimer
-from PyQt5.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PyQt5.QtGui import QBrush, QColor, QFont, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtWidgets import (
-    QApplication, QFrame, QGraphicsEllipseItem, QGraphicsPathItem,
+    QApplication, QCheckBox, QFrame, QGraphicsEllipseItem, QGraphicsPathItem,
     QGraphicsRectItem, QGraphicsScene, QGraphicsTextItem, QGraphicsView,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow,
     QMessageBox, QPushButton, QSizePolicy, QSplitter, QTextEdit, QToolBox, QTreeWidget,
@@ -12,6 +15,7 @@ from PyQt5.QtWidgets import (
 
 from pyqt_real_robot_integration import create_simulator_executor
 from pyqt_real_robot_integration import RealRobotExecutor
+from continuous_execution_manager import ContinuousExecutionManager
 from astar import get_path_length, k_shortest_paths
 from grid import (
     ROWS,
@@ -285,6 +289,10 @@ class GridView(QGraphicsView):
         self.robot_heading_item.setPath(path)
         self.robot_heading_item.setVisible(True)
 
+    def set_robot_position(self, coord, heading=None):
+        """Compatibility helper used by startup positioning code."""
+        self.show_robot_at(coord, heading=heading)
+
     def animate_path(self, path_coords, callback=None):
         if not path_coords:
             return
@@ -356,21 +364,47 @@ class AGVPathPlannerApp(QMainWindow):
 
         self.found_paths = []
         self.path_visible = []
+        self.path_distances = []  # Store path distances in mm
         self.blocked_nodes = set()
         self.G = create_networkx_grid(rows=ROWS, cols=COLS)
         self.start_coord = None
         self.goal_coord = None
         self.selected_path_index = -1
         self.block_mode = False
+        self.simulation_mode = True  # Default to simulation mode (no Arduino required)
 
         self.init_ui()
-        self.robot_executor = RealRobotExecutor(
-            self.robot_state,
-            canvas=self.canvas,
-            port='/dev/ttyACM0'
+        
+        # Initialize continuous execution manager (lazy connection)
+        self.continuous_executor = ContinuousExecutionManager(
+            robot_state=self.robot_state,
+            port='/dev/ttyUSB0',
+            baudrate=115200,
+            layout_file='apriltag_layout.json',
+            use_detector=True
         )
-        self.robot_executor.on_progress_changed = self.update_progress
-        self.robot_executor.on_error = self.show_error_dialog
+        self.continuous_executor.set_heading(self.canvas.robot_heading or SOUTH)
+        
+        # Set up callbacks
+        self.continuous_executor.on_position_update = self.on_executor_position_update
+        self.continuous_executor.on_waypoint_verified = self.on_executor_waypoint_verified
+        self.continuous_executor.on_execution_complete = self.on_executor_complete
+        self.continuous_executor.on_error = self.show_error_dialog
+
+        self.camera_preview_timer = QTimer(self)
+        self.camera_preview_timer.timeout.connect(self.refresh_camera_preview)
+        self.camera_preview_timer.start(100)
+        QTimer.singleShot(0, self.start_camera_preview)
+        
+        # Keep backward compatibility
+        self.robot_executor = self.continuous_executor
+        
+        # Set robot initial position to Tag 1 (row=0, col=0)
+        self._set_robot_to_tag_1()
+        
+        # Note: Arduino connection is deferred until execution is requested
+        # This allows path planning without requiring hardware to be connected
+        
         self.mission_controller = MissionController(
             robot_state=self.robot_state,
             robot_executor=self.robot_executor,
@@ -399,29 +433,390 @@ class AGVPathPlannerApp(QMainWindow):
             return
         self.canvas.set_paths([path_coords], selected_index=0, visible=[True])
     def execute_on_real_robot(self):
-        """Execute selected path on actual hardware."""
-        if self.selected_path_index < 0:
-            QMessageBox.warning(self, "No Path", "Select a path first")
-            return
-        
-        # Extract just the path coordinates from the tuple (path_coords, path_ids, length, cost)
-        path_data = self.found_paths[self.selected_path_index]
-        path_coords = path_data[0] if isinstance(path_data, tuple) else path_data
-        if path_coords:
+        """Execute selected path on actual hardware using continuous motion."""
+        try:
+            if self.selected_path_index < 0:
+                QMessageBox.warning(self, "No Path", "Select a path first")
+                return
+            
+            # Extract path data from the tuple (path_coords, path_ids, length, cost)
+            path_data = self.found_paths[self.selected_path_index]
+            path_coords = path_data[0] if isinstance(path_data, tuple) else path_data
+            path_distance = path_data[2] if isinstance(path_data, tuple) and len(path_data) > 2 else 0
+            
+            if not path_coords:
+                QMessageBox.warning(self, "Invalid Path", "Path is empty")
+                return
+            
             start_id = grid_coord_to_node_id(path_coords[0][0], path_coords[0][1], COLS)
             goal_id = grid_coord_to_node_id(path_coords[-1][0], path_coords[-1][1], COLS)
             self.target_node.setText(f"Node {goal_id} ({path_coords[-1][0]}, {path_coords[-1][1]})")
-        path_node_ids = [grid_coord_to_node_id(r, c, COLS) for r, c in path_coords]
-        self.robot_executor.execute_path_on_real_robot(path_coords, path_node_ids)
+            
+            # Display path distance and motion info
+            num_cells = len(path_coords) - 1
+            distance_mm = num_cells * 500  # Each cell is 500mm
+            
+            # Check if simulation mode is enabled
+            if self.simulation_mode:
+                self.commands_text.setText(
+                    f"🎮 Simulated Execution (No Hardware)\n"
+                    f"Path: {start_id} → {goal_id}\n"
+                    f"Distance: {distance_mm}mm ({num_cells} cells)\n"
+                    f"Status: Starting animation...\n"
+                )
+                
+                # Run simulation
+                self.simulate_path_execution(path_coords)
+                return
+            
+            # Real hardware execution
+            self.commands_text.setText(
+                f"🚀 Continuous Motion Execution\n"
+                f"Path: {start_id} → {goal_id}\n"
+                f"Distance: {distance_mm}mm ({num_cells} cells)\n"
+                f"Status: Establishing connection...\n"
+            )
+            
+            path_node_ids = [grid_coord_to_node_id(r, c, COLS) for r, c in path_coords]
+            
+            if not self._ensure_arduino_connection(
+                f"🔌 Connecting to Arduino at /dev/ttyUSB0...\n"
+                f"Path: {start_id} → {goal_id}\n"
+                f"Distance: {distance_mm}mm ({num_cells} cells)\n"
+            ):
+                return
+            
+            # Execute using new continuous executor (non-blocking, uses callbacks)
+            self.continuous_executor.execute_path_continuous(
+                path_coords=path_coords,
+                path_node_ids=path_node_ids,
+                direction='F'  # Forward direction
+            )
+        except Exception as e:
+            print(f"[ERROR] execute_on_real_robot failed: {e}")
+            import traceback
+            traceback.print_exc()
+            self.show_error_dialog(f"Failed to execute path: {str(e)}")
     
     def update_progress(self, current: int, total: int):
         """Update progress display."""
         pct = int(100 * current / total) if total > 0 else 0
         self.commands_text.setText(f"Progress: {current}/{total} ({pct}%)")
+
+    def _is_arduino_connected(self) -> bool:
+        """Check whether the executor already has an open Arduino serial port."""
+        if hasattr(self.continuous_executor, "is_connected"):
+            return self.continuous_executor.is_connected()
+
+        return (
+            self.continuous_executor.serial is not None and
+            hasattr(self.continuous_executor.serial, 'is_open') and
+            self.continuous_executor.serial.is_open
+        )
+
+    def _set_robot_to_tag_1(self):
+        """Set robot's initial position to Tag 1 (row=0, col=0)."""
+        tag_1_coord = (0, 0)  # Tag 1 is at row 0, col 0
+        tag_1_id = 1
+
+        # Keep the planner state aligned with the robot's real startup cell.
+        self.start_coord = tag_1_coord
+        self.goal_coord = None
+
+        # Update robot state
+        self.robot_state.set_position_from_tag(tag_1_id)
+
+        # Update canvas to show robot at Tag 1
+        self.canvas.set_robot_position(tag_1_coord, heading=SOUTH)
+
+        # Update UI labels
+        if hasattr(self, 'start_input'):
+            self.start_input.setText("Node 1 (0, 0)")
+        if hasattr(self, 'goal_input'):
+            self.goal_input.clear()
+        if hasattr(self, 'target_node'):
+            self.target_node.setText("---")
     
+    def _ensure_arduino_connection(self, status_text: str) -> bool:
+        """Open the Arduino serial connection on demand."""
+        if self._is_arduino_connected():
+            return True
+
+        self.commands_text.setText(status_text)
+        QApplication.processEvents()
+
+        if self.continuous_executor.connect():
+            return True
+
+        self.commands_text.setText(
+            f"{status_text}"
+            "❌ Could not open Arduino serial connection.\n\n"
+            "Check USB cable, /dev/ttyUSB0, firmware upload, and serial permissions.\n"
+        )
+        return False
+    
+    def _confirm_start_tag_detected(self, start_tag_id: int, timeout_sec: float = 5.0) -> bool:
+        """Require a new live detection of the selected start tag before motion begins."""
+        if not getattr(self.continuous_executor, 'use_detector', False):
+            warning = (
+                "AprilTag start confirmation requires the camera detector to be enabled.\n\n"
+                f"Selected start tag: {start_tag_id}"
+            )
+            self.commands_text.setText(f"❌ {warning}")
+            QMessageBox.warning(self, "Start Tag Required", warning)
+            return False
+
+        self.commands_text.setText(
+            f"📷 Waiting for live start tag {start_tag_id} before motion...\n"
+            f"After pressing Start Mission, place Tag {start_tag_id} clearly in the camera view.\n"
+        )
+        QApplication.processEvents()
+
+        if not self.continuous_executor.ensure_detector_running(wait=True, timeout_sec=timeout_sec):
+            warning = (
+                "AprilTag camera is not ready.\n\n"
+                f"Place the AGV on Tag {start_tag_id} and make sure the live preview is running."
+            )
+            self.commands_text.setText(f"❌ {warning}")
+            QMessageBox.warning(self, "Start Tag Required", warning)
+            return False
+
+        detector = getattr(self.continuous_executor, 'detector', None)
+        if detector is None:
+            warning = "AprilTag detector is unavailable."
+            self.commands_text.setText(f"❌ {warning}")
+            QMessageBox.warning(self, "Start Tag Required", warning)
+            return False
+
+        if hasattr(detector, 'reset_detection_cache'):
+            detector.reset_detection_cache()
+
+        max_age_sec = float(getattr(self.continuous_executor, '_max_detection_age_sec', 0.75))
+        deadline = time.time() + timeout_sec
+        wait_started_at = time.time()
+        stable_reads = 0
+        last_timestamp = None
+
+        while time.time() < deadline:
+            QApplication.processEvents()
+            detections = detector.get_last_detection_details()
+            measurement = detections.get(start_tag_id)
+
+            if measurement is not None:
+                timestamp = float(measurement.get('timestamp', 0.0))
+                age_sec = time.time() - timestamp
+                if timestamp >= wait_started_at and age_sec <= max_age_sec:
+                    if timestamp != last_timestamp:
+                        stable_reads += 1
+                        last_timestamp = timestamp
+                    if stable_reads >= 2:
+                        self.robot_state.set_position_from_tag(start_tag_id)
+                        coord = node_id_to_grid_coord(start_tag_id, COLS)
+                        self.canvas.show_robot_at(coord)
+                        self.commands_text.setText(
+                            f"✅ Live start tag {start_tag_id} detected.\n"
+                            "Mission starting..."
+                        )
+                        return True
+                else:
+                    stable_reads = 0
+                    last_timestamp = None
+            else:
+                stable_reads = 0
+                last_timestamp = None
+
+            remaining_sec = max(0.0, deadline - time.time())
+            self.commands_text.setText(
+                f"📷 Waiting for live start tag {start_tag_id} before motion...\n"
+                f"After pressing Start Mission, place Tag {start_tag_id} clearly in the camera view.\n"
+                f"Need 2 fresh frames. Time left: {remaining_sec:.1f}s"
+            )
+            time.sleep(0.05)
+
+        warning = (
+            f"Live start tag {start_tag_id} was not detected after Start Mission.\n\n"
+            f"Place Tag {start_tag_id} in front of the camera and try again."
+        )
+        self.commands_text.setText(f"❌ {warning}")
+        QMessageBox.warning(self, "Start Tag Required", warning)
+        return False
+
     def show_error_dialog(self, error_msg: str):
         """Show error popup."""
+        self.commands_text.setText(f"❌ Execution Error\n{error_msg}")
         QMessageBox.critical(self, "Execution Error", error_msg)
+
+    def start_camera_preview(self):
+        """Start the detector as soon as the app launches."""
+        if not hasattr(self, 'continuous_executor'):
+            return
+        self._set_camera_preview_status("Starting AprilTag camera preview...")
+        self.continuous_executor.ensure_detector_running(wait=False)
+
+    def refresh_camera_preview(self):
+        """Display the latest annotated detector frame inside the PyQt UI."""
+        if not hasattr(self, 'camera_feed_label'):
+            return
+
+        detector = getattr(self.continuous_executor, 'detector', None) if hasattr(self, 'continuous_executor') else None
+        if detector is None:
+            self._set_camera_preview_status("Starting AprilTag camera preview...")
+            return
+
+        frame = detector.get_latest_preview_frame()
+        if frame is None:
+            detector_state = getattr(detector, 'state', None)
+            state_label = detector_state.value if detector_state is not None else "IDLE"
+            self._set_camera_preview_status(f"Camera preview waiting... detector state: {state_label}")
+            return
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        height, width, channels = rgb_frame.shape
+        image = QImage(
+            rgb_frame.data,
+            width,
+            height,
+            channels * width,
+            QImage.Format_RGB888,
+        ).copy()
+
+        pixmap = QPixmap.fromImage(image)
+        scaled_pixmap = pixmap.scaled(
+            self.camera_feed_label.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self.camera_feed_label.setText("")
+        self.camera_feed_label.setPixmap(scaled_pixmap)
+
+    def _set_camera_preview_status(self, message: str):
+        """Show a friendly placeholder when live video is not available yet."""
+        self.camera_feed_label.setPixmap(QPixmap())
+        self.camera_feed_label.setText(message)
+
+    def closeEvent(self, event):
+        """Stop detector and serial resources when the UI closes."""
+        try:
+            self.camera_preview_timer.stop()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, 'continuous_executor') and self.continuous_executor is not None:
+                self.continuous_executor.disconnect()
+        except Exception as close_error:
+            print(f"[WARN] Cleanup during closeEvent failed: {close_error}")
+
+        super().closeEvent(event)
+
+    def on_executor_position_update(self, distance_mm: float, progress_percent: float, speed_rpm: float = 0):
+        """Callback from continuous executor reporting position updates."""
+        status_text = (
+            f"📍 Motion Update\n"
+            f"Distance: {distance_mm:.1f}mm\n"
+            f"Progress: {progress_percent:.1f}%\n"
+            f"Speed: {speed_rpm:.1f} RPM\n"
+        )
+        self.commands_text.setText(status_text)
+
+    def on_executor_waypoint_verified(self, tag_id: int, expected: bool = True):
+        """Callback when AprilTag waypoint is verified during motion."""
+        status = "✓ Verified" if expected else "⚠ Unexpected"
+        self.commands_text.setText(
+            f"📌 Waypoint Detected\n"
+            f"Tag ID: {tag_id}\n"
+            f"Status: {status}\n"
+        )
+
+    def on_executor_complete(self, success: bool = True, message: str = ""):
+        """Callback when continuous motion execution completes."""
+        if success:
+            status_text = f"✅ Execution Complete\n{message}"
+            QMessageBox.information(self, "Success", "Path execution completed successfully!")
+        else:
+            status_text = f"❌ Execution Failed\n{message}"
+            QMessageBox.warning(self, "Execution Failed", message)
+        
+        self.commands_text.setText(status_text)
+
+    def test_arduino_connection(self):
+        """Test connection to Arduino."""
+        self.commands_text.setText("🔌 Testing Arduino connection...\n")
+        QApplication.processEvents()
+        
+        if self._is_arduino_connected():
+            self.commands_text.setText("🔌 Already connected to Arduino\n✓ Serial port is open\n")
+            return
+        
+        try:
+            if not self._ensure_arduino_connection(
+                "🔌 Testing Arduino connection...\n"
+                "Attempting to connect to /dev/ttyUSB0 @115200...\n"
+            ):
+                return
+            
+            self.commands_text.setText(
+                "✅ Connected to Arduino!\n\n"
+                "Status:\n"
+                "• Port: /dev/ttyUSB0\n"
+                "• Baud rate: 115200\n"
+                "• Ready for execution\n"
+                "• Uncheck Simulation Mode before starting the real mission\n"
+            )
+            QMessageBox.information(self, "Success", "Successfully connected to Arduino!")
+            
+        except Exception as e:
+            error_text = f"❌ Error: {str(e)}\n"
+            self.commands_text.setText(error_text)
+            QMessageBox.critical(self, "Connection Error", error_text)
+
+    def on_simulation_mode_changed(self, state):
+        """Handle simulation mode toggle."""
+        self.simulation_mode = (state == Qt.Checked)
+        mode_text = "ON (No Hardware)" if self.simulation_mode else "OFF (Real Hardware)"
+        self.commands_text.setText(f"🎮 Simulation Mode: {mode_text}\n\nIn simulation mode, the app will animate robot movement\non the grid without requiring Arduino hardware.")
+
+    def simulate_path_execution(self, path_coords: List[Tuple[int, int]]):
+        """Simulate path execution by animating robot movement on grid."""
+        if not path_coords or len(path_coords) < 1:
+            return
+        
+        print(f"[Simulator] Animating path: {path_coords}")
+        
+        # Calculate animation parameters
+        num_cells = len(path_coords) - 1
+        distance_mm = num_cells * 500
+        animation_time_sec = 14.0  # Simulate ~14 seconds for full motion
+        steps = max(len(path_coords), 10)
+        delay_per_step = (animation_time_sec * 1000) // steps  # milliseconds
+        
+        # Update status
+        self.commands_text.setText(
+            f"🎮 Simulated Execution\n"
+            f"Distance: {distance_mm}mm ({num_cells} cells)\n"
+            f"Status: Starting animation...\n"
+        )
+        
+        # Animate along path
+        for i, coord in enumerate(path_coords):
+            progress = int(100 * i / len(path_coords))
+            self.canvas.show_robot_at(coord)
+            self.commands_text.setText(
+                f"🎮 Simulated Execution\n"
+                f"Distance: {distance_mm}mm ({num_cells} cells)\n"
+                f"Progress: {progress}%\n"
+                f"Position: ({coord[0]}, {coord[1]})\n"
+            )
+            QApplication.processEvents()  # Update UI
+            time.sleep(delay_per_step / 1000.0)  # Delay in seconds
+        
+        # Completion
+        self.commands_text.setText(
+            f"✅ Simulation Complete\n"
+            f"Distance: {distance_mm}mm\n"
+            f"Status: Path animation finished successfully!"
+        )
+        QMessageBox.information(self, "Success", "Simulated path execution completed!")
 
     def init_ui(self):
         central_widget = QWidget()
@@ -487,7 +882,7 @@ class AGVPathPlannerApp(QMainWindow):
 
         self.commands_text = QTextEdit()
         self.commands_text.setReadOnly(True)
-        self.commands_text.setMaximumHeight(120)
+        self.commands_text.setMinimumHeight(220)
         self.commands_text.setPlainText("Commands will appear here when a path is executed...")
         self.commands_text.setStyleSheet("""
             QTextEdit {
@@ -500,11 +895,38 @@ class AGVPathPlannerApp(QMainWindow):
         """)
         commands_layout.addWidget(self.commands_text)
 
+        camera_group = QGroupBox("Live Camera Feed")
+        camera_layout = QVBoxLayout(camera_group)
+        camera_layout.setContentsMargins(8, 8, 8, 8)
+
+        self.camera_feed_label = QLabel("Starting AprilTag camera preview...")
+        self.camera_feed_label.setAlignment(Qt.AlignCenter)
+        self.camera_feed_label.setMinimumSize(420, 260)
+        self.camera_feed_label.setStyleSheet("""
+            QLabel {
+                border: 1px solid #bdc3c7;
+                border-radius: 3px;
+                background-color: #17202a;
+                color: #d6dbdf;
+                padding: 8px;
+            }
+        """)
+        camera_layout.addWidget(self.camera_feed_label)
+
+        lower_splitter = QSplitter(Qt.Horizontal)
+        lower_splitter.setChildrenCollapsible(False)
+        lower_splitter.addWidget(camera_group)
+        lower_splitter.addWidget(commands_group)
+        lower_splitter.setStretchFactor(0, 2)
+        lower_splitter.setStretchFactor(1, 1)
+
         vertical_splitter = QSplitter(Qt.Vertical)
+        vertical_splitter.setChildrenCollapsible(False)
         vertical_splitter.addWidget(views_splitter)
-        vertical_splitter.addWidget(commands_group)
+        vertical_splitter.addWidget(lower_splitter)
         vertical_splitter.setStretchFactor(0, 5)
-        vertical_splitter.setStretchFactor(1, 1)
+        vertical_splitter.setStretchFactor(1, 2)
+        vertical_splitter.setSizes([720, 320])
 
         layout.addWidget(vertical_splitter, 1)
 
@@ -587,6 +1009,13 @@ class AGVPathPlannerApp(QMainWindow):
         self.block_btn.setStyleSheet(button_style_template.format(color="#d9534f", hover_color="#c9302c", pressed_color="#ac2925"))
         self.block_btn.clicked.connect(self.block_selected_path)
         action_row.addWidget(self.block_btn)
+        
+        self.test_connection_btn = QPushButton("🔌 Test Arduino")
+        self.test_connection_btn.setStyleSheet(button_style_template.format(
+            color="#8e44ad", hover_color="#7d3c98", pressed_color="#6c2d7c"
+        ))
+        self.test_connection_btn.clicked.connect(self.test_arduino_connection)
+        action_row.addWidget(self.test_connection_btn)
 
         # self.replan_btn = QPushButton("Replan")
         # self.replan_btn.setStyleSheet(button_style_template.format(color="#f0ad4e", hover_color="#ec971f", pressed_color="#d58512"))
@@ -595,7 +1024,25 @@ class AGVPathPlannerApp(QMainWindow):
 
         layout.addLayout(action_row)
 
-        # Paths Tree
+        # Simulation Mode Toggle
+        mode_layout = QHBoxLayout()
+        mode_label = QLabel("🎮 Simulation Mode:")
+        mode_label.setStyleSheet("font-weight: bold; color: #2c3e50; font-size: 10px;")
+        
+        self.simulation_mode_checkbox = QCheckBox("Enabled (No Hardware)")
+        self.simulation_mode_checkbox.setChecked(True)
+        self.simulation_mode_checkbox.stateChanged.connect(self.on_simulation_mode_changed)
+        self.simulation_mode_checkbox.setStyleSheet("""
+            QCheckBox {
+                color: #2c3e50;
+                font-weight: bold;
+            }
+        """)
+        
+        mode_layout.addWidget(mode_label)
+        mode_layout.addWidget(self.simulation_mode_checkbox)
+        mode_layout.addStretch()
+        layout.addLayout(mode_layout)
         self.toolbox = QToolBox()
         self.toolbox.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.toolbox.setStyleSheet("""
@@ -711,61 +1158,82 @@ class AGVPathPlannerApp(QMainWindow):
         return panel
 
     def on_cell_clicked(self, row, col):
-        self._handle_coord_selected((row, col))
+        try:
+            print(f"[DEBUG] Grid cell clicked: ({row}, {col})")
+            self._handle_coord_selected((row, col))
+        except Exception as e:
+            print(f"[ERROR] Grid click failed: {e}")
+            import traceback
+            traceback.print_exc()
+            self.show_error_dialog(f"Grid click error: {str(e)}")
 
     def on_tag_clicked(self, tag_id):
-        coord = node_id_to_grid_coord(tag_id, COLS)
-        self._handle_coord_selected(coord, node_id=tag_id)
+        try:
+            print(f"[DEBUG] Tag clicked: {tag_id}")
+            coord = node_id_to_grid_coord(tag_id, COLS)
+            self._handle_coord_selected(coord, node_id=tag_id)
+        except Exception as e:
+            print(f"[ERROR] Tag click failed: {e}")
+            import traceback
+            traceback.print_exc()
+            self.show_error_dialog(f"Tag click error: {str(e)}")
 
     def _handle_coord_selected(self, coord, node_id=None):
-        row, col = coord
-        if node_id is None:
-            node_id = grid_coord_to_node_id(row, col, COLS)
-        else:
-            node_id = int(node_id)
+        try:
+            row, col = coord
+            if node_id is None:
+                node_id = grid_coord_to_node_id(row, col, COLS)
+            else:
+                node_id = int(node_id)
 
-        if self.block_mode:
-            self.block_mode = False
-            if coord != self.start_coord and coord != self.goal_coord:
+            if self.block_mode:
+                self.block_mode = False
+                if coord != self.start_coord and coord != self.goal_coord:
+                    if coord in self.blocked_nodes:
+                        self.blocked_nodes.remove(coord)
+                    else:
+                        self.blocked_nodes.add(coord)
+                    self.replan_paths()
+                self.canvas.set_overlays(self.start_coord, self.goal_coord, self.blocked_nodes)
+                self.robot_state.set_status("IDLE")
+                return
+
+            if self.start_coord is None:
                 if coord in self.blocked_nodes:
                     self.blocked_nodes.remove(coord)
-                else:
-                    self.blocked_nodes.add(coord)
-                self.replan_paths()
+                self.start_coord = coord
+                self.start_input.setText(f"Node {node_id} ({row}, {col})")
+                self.canvas.robot_heading = None
+                self.canvas.robotHeadingChanged.emit(None)
+                self.target_node.setText("---")
+            elif self.goal_coord is None:
+                if coord == self.start_coord:
+                    return
+                if coord in self.blocked_nodes:
+                    self.blocked_nodes.remove(coord)
+                self.goal_coord = coord
+                self.goal_input.setText(f"Node {node_id} ({row}, {col})")
+                self.target_node.setText(f"Node {node_id} ({row}, {col})")
+                print(f"[DEBUG] Computing paths from {self.start_coord} to {self.goal_coord}")
+                self.compute_paths()
+            else:
+                if coord in self.blocked_nodes:
+                    self.blocked_nodes.remove(coord)
+                self.start_coord = coord
+                self.goal_coord = None
+                self.start_input.setText(f"Node {node_id} ({row}, {col})")
+                self.goal_input.clear()
+                self.target_node.setText("---")
+                self.canvas.robot_heading = None
+                self.canvas.robotHeadingChanged.emit(None)
+                self.clear_paths()
+
             self.canvas.set_overlays(self.start_coord, self.goal_coord, self.blocked_nodes)
-            self.robot_state.set_status("IDLE")
-            return
-
-        if self.start_coord is None:
-            if coord in self.blocked_nodes:
-                self.blocked_nodes.remove(coord)
-            self.start_coord = coord
-            self.start_input.setText(f"Node {node_id} ({row}, {col})")
-            self.canvas.robot_heading = None
-            self.canvas.robotHeadingChanged.emit(None)
-            self.target_node.setText("---")
-        elif self.goal_coord is None:
-            if coord == self.start_coord:
-                return
-            if coord in self.blocked_nodes:
-                self.blocked_nodes.remove(coord)
-            self.goal_coord = coord
-            self.goal_input.setText(f"Node {node_id} ({row}, {col})")
-            self.target_node.setText(f"Node {node_id} ({row}, {col})")
-            self.compute_paths()
-        else:
-            if coord in self.blocked_nodes:
-                self.blocked_nodes.remove(coord)
-            self.start_coord = coord
-            self.goal_coord = None
-            self.start_input.setText(f"Node {node_id} ({row}, {col})")
-            self.goal_input.clear()
-            self.target_node.setText("---")
-            self.canvas.robot_heading = None
-            self.canvas.robotHeadingChanged.emit(None)
-            self.clear_paths()
-
-        self.canvas.set_overlays(self.start_coord, self.goal_coord, self.blocked_nodes)
+        except Exception as e:
+            print(f"[ERROR] Coordinate selection error: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
     def on_robot_moved(self, row, col):
         """Update current position display when robot moves during animation."""
@@ -776,6 +1244,8 @@ class AGVPathPlannerApp(QMainWindow):
         if heading is None:
             self.heading.setText("---")
             return
+        if hasattr(self, "continuous_executor") and self.continuous_executor is not None:
+            self.continuous_executor.set_heading(heading)
         label = {
             NORTH: "NORTH",
             EAST: "EAST",
@@ -792,61 +1262,88 @@ class AGVPathPlannerApp(QMainWindow):
         self.G = create_networkx_grid(rows=ROWS, cols=COLS, obstacles=self.blocked_nodes)
 
     def compute_paths(self):
-        if self.start_coord is None or self.goal_coord is None:
-            return
+        try:
+            if self.start_coord is None or self.goal_coord is None:
+                return
 
-        self.rebuild_graph()
-        path_coords_list = k_shortest_paths(
-            self.G,
-            self.start_coord,
-            self.goal_coord,
-            k=NUM_PATHS,
-        )
+            print(f"[DEBUG] compute_paths: start={self.start_coord}, goal={self.goal_coord}")
+            self.rebuild_graph()
+            path_coords_list = k_shortest_paths(
+                self.G,
+                self.start_coord,
+                self.goal_coord,
+                k=NUM_PATHS,
+            )
 
-        self.found_paths.clear()
-        self.path_visible.clear()
-        self.paths_tree.blockSignals(True)
-        self.paths_tree.clear()
-        self.selected_path_index = -1
+            self.found_paths.clear()
+            self.path_visible.clear()
+            self.path_distances.clear()
+            self.paths_tree.blockSignals(True)
+            self.paths_tree.clear()
+            self.selected_path_index = -1
 
-        if not path_coords_list:
+            if not path_coords_list:
+                print("[DEBUG] No paths found")
+                self.paths_tree.blockSignals(False)
+                self.canvas.set_paths([], selected_index=-1, visible=[])
+                return
+
+            print(f"[DEBUG] Found {len(path_coords_list)} paths")
+            for i, path_coords in enumerate(path_coords_list):
+                path_node_ids = [grid_coord_to_node_id(r, c, COLS) for r, c in path_coords]
+                path_length = len(path_coords)
+                cost = get_path_length(self.G, path_coords)
+                
+                # Calculate continuous motion distance: (num_cells) * 500mm per cell
+                num_cells = path_length - 1
+                distance_mm = num_cells * 500
+                
+                self.found_paths.append((path_coords, path_node_ids, distance_mm, cost))
+                self.path_distances.append(distance_mm)
+                self.path_visible.append(True)
+
+                item = QTreeWidgetItem()
+                item.setText(0, f"Path {i + 1}")
+                item.setText(1, f"{path_length} cells")
+                item.setText(2, f"{distance_mm}mm")  # Show distance in mm
+                item.setData(0, Qt.UserRole, i)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
+                item.setCheckState(0, Qt.Checked)
+
+                color = QColor(PATH_COLORS[i % len(PATH_COLORS)])
+                pixmap = QPixmap(16, 16)
+                pixmap.fill(color)
+                item.setIcon(0, QIcon(pixmap))
+
+                self.paths_tree.addTopLevelItem(item)
+
             self.paths_tree.blockSignals(False)
-            self.canvas.set_paths([], selected_index=-1, visible=[])
-            return
+            self.paths_tree.resizeColumnToContents(0)
+            print(f"[DEBUG] Drawing {len(self.found_paths)} paths on canvas")
+            self.canvas.set_paths([p[0] for p in self.found_paths])
 
-        for i, path_coords in enumerate(path_coords_list):
-            path_node_ids = [grid_coord_to_node_id(r, c, COLS) for r, c in path_coords]
-            path_length = len(path_coords)
-            cost = get_path_length(self.G, path_coords)
-            self.found_paths.append((path_coords, path_node_ids, path_length, cost))
-            self.path_visible.append(True)
+            if self.paths_tree.topLevelItemCount() > 0:
+                first_item = self.paths_tree.topLevelItem(0)
+                self.paths_tree.clearSelection()
+                self.paths_tree.setCurrentItem(first_item)
+                first_item.setSelected(True)
+                self.selected_path_index = 0
+                self.canvas.update_path_styles(
+                    [p[0] for p in self.found_paths],
+                    self.selected_path_index,
+                    self.path_visible,
+                )
 
-            item = QTreeWidgetItem()
-            item.setText(0, f"Path {i + 1}")
-            item.setText(1, str(path_length))
-            item.setText(2, str(cost))
-            item.setData(0, Qt.UserRole, i)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
-            item.setCheckState(0, Qt.Checked)
-
-            color = QColor(PATH_COLORS[i % len(PATH_COLORS)])
-            pixmap = QPixmap(16, 16)
-            pixmap.fill(color)
-            item.setIcon(0, QIcon(pixmap))
-
-            self.paths_tree.addTopLevelItem(item)
-
-        self.paths_tree.blockSignals(False)
-        self.paths_tree.resizeColumnToContents(0)
-        self.canvas.set_paths([p[0] for p in self.found_paths])
-
-        if self.paths_tree.topLevelItemCount() > 0:
-            first_item = self.paths_tree.topLevelItem(0)
-            self.paths_tree.setCurrentItem(first_item)
-
-        if self.start_coord is not None:
-            start_id = grid_coord_to_node_id(self.start_coord[0], self.start_coord[1], COLS)
-            self.target_node.setText(f"Node {start_id} ({self.start_coord[0]}, {self.start_coord[1]})")
+            if self.goal_coord is not None:
+                goal_id = grid_coord_to_node_id(self.goal_coord[0], self.goal_coord[1], COLS)
+                self.target_node.setText(f"Node {goal_id} ({self.goal_coord[0]}, {self.goal_coord[1]})")
+            
+            print("[DEBUG] compute_paths completed successfully")
+        except Exception as e:
+            print(f"[ERROR] compute_paths failed: {e}")
+            import traceback
+            traceback.print_exc()
+            self.show_error_dialog(f"Path computation error: {str(e)}")
 
     def compute_single_path(self, start_coord, goal_coord):
         self.rebuild_graph()
@@ -869,17 +1366,40 @@ class AGVPathPlannerApp(QMainWindow):
         self.selected_path_index = -1
         self.canvas.set_paths([], selected_index=-1, visible=[])
 
+    def _activate_path_item(self, item):
+        """Make one path the single active execution path in the UI."""
+        idx = item.data(0, Qt.UserRole)
+        if idx is None:
+            return
+        idx = int(idx)
+        if idx < 0 or idx >= len(self.found_paths):
+            return
+
+        self.paths_tree.blockSignals(True)
+        for row in range(self.paths_tree.topLevelItemCount()):
+            row_item = self.paths_tree.topLevelItem(row)
+            row_idx = row_item.data(0, Qt.UserRole)
+            if row_idx is None:
+                continue
+            row_idx = int(row_idx)
+            is_active = row_idx == idx
+            row_item.setCheckState(0, Qt.Checked if is_active else Qt.Unchecked)
+            if row_idx < len(self.path_visible):
+                self.path_visible[row_idx] = is_active
+        self.paths_tree.blockSignals(False)
+
+        self.paths_tree.setCurrentItem(item)
+        item.setSelected(True)
+        self.selected_path_index = idx
+        self.canvas.update_path_styles([p[0] for p in self.found_paths], self.selected_path_index, self.path_visible)
+
     def on_path_selected(self):
         items = self.paths_tree.selectedItems()
         if not items:
             self.selected_path_index = -1
             self.canvas.update_path_styles([p[0] for p in self.found_paths], -1, self.path_visible)
             return
-        idx = items[0].data(0, Qt.UserRole)
-        if idx is None:
-            return
-        self.selected_path_index = int(idx)
-        self.canvas.update_path_styles([p[0] for p in self.found_paths], self.selected_path_index, self.path_visible)
+        self._activate_path_item(items[0])
 
     def on_path_item_changed(self, item, column):
         if column != 0:
@@ -890,7 +1410,15 @@ class AGVPathPlannerApp(QMainWindow):
         idx = int(idx)
         if idx < 0 or idx >= len(self.path_visible):
             return
-        self.path_visible[idx] = item.checkState(0) == Qt.Checked
+
+        if item.checkState(0) == Qt.Checked:
+            self._activate_path_item(item)
+            return
+
+        if idx < len(self.path_visible):
+            self.path_visible[idx] = False
+        if self.selected_path_index == idx:
+            self.selected_path_index = -1
         self.canvas.update_path_styles([p[0] for p in self.found_paths], self.selected_path_index, self.path_visible)
 
     def execute_selected_path(self):
@@ -923,6 +1451,35 @@ class AGVPathPlannerApp(QMainWindow):
         if self.start_coord is None or self.goal_coord is None:
             QMessageBox.warning(self, "No Mission", "Select pickup and drop nodes first")
             return
+
+        if self.simulation_mode:
+            self.commands_text.setText(
+                "🎮 Simulation Mode is enabled.\n\n"
+                "Uncheck 'Simulation Mode' to run the mission on Arduino.\n"
+                "You can use 'Test Arduino' first to verify /dev/ttyUSB0.\n"
+            )
+            QMessageBox.information(
+                self,
+                "Simulation Mode Enabled",
+                "Uncheck 'Simulation Mode' before starting a real Arduino mission."
+            )
+            return
+
+        pickup_id = grid_coord_to_node_id(self.start_coord[0], self.start_coord[1], COLS)
+        drop_id = grid_coord_to_node_id(self.goal_coord[0], self.goal_coord[1], COLS)
+
+        if not self._confirm_start_tag_detected(pickup_id):
+            return
+
+        if not self._ensure_arduino_connection(
+            f"🚀 Starting Mission\n"
+            f"Current node: {self.robot_state.current_node}\n"
+            f"Pickup node: {pickup_id}\n"
+            f"Drop node: {drop_id}\n"
+            f"Status: Connecting to Arduino...\n"
+        ):
+            return
+
         self.mission_controller.start_mission(self.start_coord, self.goal_coord)
 
     def stop_mission(self):

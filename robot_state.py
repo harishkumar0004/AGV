@@ -33,6 +33,10 @@ class RobotState(QObject):
             self._save_state()
             self.node_changed.emit(new_node)
 
+    def set_position_from_tag(self, tag_id: int) -> None:
+        """Compatibility helper: tag IDs map directly to node IDs in this layout."""
+        self.update_node(tag_id)
+
     def set_status(self, new_status: str) -> None:
         if new_status != self._status:
             self._status = new_status

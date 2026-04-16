@@ -20,6 +20,8 @@ from threading import Event, Lock
 from enum import Enum
 from typing import List, Tuple, Optional, Callable
 
+from apriltag_detector_realtime import AprilTagDetectorRealtime
+
 class ExecutionState(Enum):
     """Master controller states."""
     IDLE = "IDLE"
@@ -33,10 +35,11 @@ class ExecutionState(Enum):
 
 class CommandType(Enum):
     """Motion commands."""
-    FORWARD = 'f'      # Move forward 1 cell (50cm)
-    BACKWARD = 'b'     # Move backward 1 cell
-    TURN_LEFT = 'l'    # 90° CCW turn
-    TURN_RIGHT = 'r'   # 90° CW turn
+    FORWARD = 'f'       # Move forward 1 cell (500mm)
+    BACKWARD = 'b'      # Move backward 1 cell
+    TURN_LEFT = 'l'     # 90° CCW turn
+    TURN_RIGHT = 'r'    # 90° CW turn
+    STOP = 's'          # Emergency stop (sent when AprilTag detected)
 
 
 class Heading(Enum):
@@ -304,11 +307,15 @@ class ExecutionManager:
         executor.execute_path(path_coords, path_node_ids)
     """
 
-    def __init__(self, robot_state, port: str = '/dev/ttyACM0', baudrate: int = 9600):
+    def __init__(self, robot_state, port: str = '/dev/ttyACM0', baudrate: int = 9600,
+                 layout_file: str = 'apriltag_layout.json', use_apriltag_confirmation: bool = True):
         """
         Args:
+            robot_state: RobotState instance for tracking position
             port: Serial port for Arduino
             baudrate: Serial baud rate
+            layout_file: Path to apriltag_layout.json for real-time detection
+            use_apriltag_confirmation: If True, use AprilTag detection for position
         """
         self.robot_state = robot_state
         self.serial_cmd = SerialCommander(port=port, baudrate=baudrate)
@@ -321,6 +328,12 @@ class ExecutionManager:
         self.current_position: Tuple[int, int] = (0, 0)
         self.current_heading = Heading.SOUTH
         self._stop_requested = False
+
+        # AprilTag detector (for real-time position confirmation)
+        self.use_apriltag_confirmation = use_apriltag_confirmation
+        self.detector: Optional[AprilTagDetectorRealtime] = None
+        if use_apriltag_confirmation:
+            self.detector = AprilTagDetectorRealtime(layout_file=layout_file)
 
         # Callbacks
         self.on_state_change: Optional[Callable[[ExecutionState], None]] = None
@@ -347,17 +360,32 @@ class ExecutionManager:
             self.on_error(msg)
 
     def connect(self) -> bool:
-        """Establish connection to Arduino."""
+        """Establish connection to Arduino and start AprilTag detector."""
         self._set_state(ExecutionState.INITIALIZING)
-        if self.serial_cmd.connect():
-            self._set_state(ExecutionState.IDLE)
-            return True
-        else:
+        
+        # Connect to Arduino
+        if not self.serial_cmd.connect():
             self._error("Failed to connect to Arduino")
             return False
+        
+        # Start AprilTag detector if enabled
+        if self.use_apriltag_confirmation and self.detector:
+            print("[ExecutionManager] Starting AprilTag detector...")
+            if not self.detector.start():
+                self._error("Failed to start AprilTag detector (fallback to time-based ACK)")
+                self.use_apriltag_confirmation = False
+            else:
+                print("[ExecutionManager] AprilTag detector started successfully")
+        
+        self._set_state(ExecutionState.IDLE)
+        return True
 
     def disconnect(self) -> None:
-        """Close connection to Arduino."""
+        """Close connection to Arduino and stop detector."""
+        if self.detector and self.detector.is_running():
+            print("[ExecutionManager] Stopping AprilTag detector...")
+            self.detector.stop()
+        
         self.serial_cmd.disconnect()
         self._set_state(ExecutionState.IDLE)
 
@@ -400,10 +428,123 @@ class ExecutionManager:
         # Begin state machine
         self._execute_next_command()
 
+    def _send_and_wait_for_confirmation(self, cmd: CommandType) -> bool:
+        """
+        Send a command to Arduino and wait for either:
+        - AprilTag detection confirming next waypoint (if detector enabled)
+        - Serial ACK from Arduino (fallback)
+
+        Args:
+            cmd: CommandType to send
+
+        Returns:
+            True if confirmation received, False on error or timeout
+        """
+        # Send command to Arduino
+        if not self.serial_cmd.send_command(cmd):
+            self._error(f"Failed to send command: {cmd.value}")
+            return False
+
+        print(f"[ExecutionManager] Command sent: {cmd.value}, waiting for confirmation...")
+
+        if not self.use_apriltag_confirmation or not self.detector:
+            # Fallback: Use serial ACK
+            print("[ExecutionManager] Using serial ACK (AprilTag detection disabled)")
+            success, response = self.serial_cmd.wait_for_ack()
+            if not success:
+                self._error(f"No ACK received for command {cmd.value}")
+            return success
+
+        # ====================================================================
+        # PRIMARY: Wait for AprilTag detection at next waypoint
+        # ====================================================================
+        
+        # Determine expected next position after command execution
+        expected_next_pos = self._predict_next_position(cmd)
+        
+        if expected_next_pos is None:
+            # Turn command - no position change, just wait for tag any tag
+            print("[ExecutionManager] Turn command - waiting for any tag detection...")
+            detected_tag = self.detector.wait_for_tag(expected_tag=None, timeout=10.0)
+            if detected_tag:
+                print(f"[ExecutionManager] Tag {detected_tag} detected (turn confirmed)")
+                return True
+            else:
+                self._error("Timeout waiting for tag detection after turn")
+                return False
+
+        # Movement command - wait for specific tag at expected position
+        expected_tag_id = self._get_tag_id_at_position(expected_next_pos)
+
+        if expected_tag_id is None:
+            print(f"[ExecutionManager] WARN: No tag mapped at position {expected_next_pos}, using serial ACK fallback")
+            success, response = self.serial_cmd.wait_for_ack()
+            return success
+
+        print(f"[ExecutionManager] Waiting for Tag {expected_tag_id} at position {expected_next_pos}...")
+        detected_tag = self.detector.wait_for_tag(expected_tag=expected_tag_id, timeout=10.0)
+
+        if detected_tag == expected_tag_id:
+            print(f"[ExecutionManager] Tag {expected_tag_id} detected at correct position! ✓")
+            return True
+        elif detected_tag is not None:
+            # Different tag detected - might have drifted
+            self._error(f"Expected tag {expected_tag_id} but detected tag {detected_tag} instead!")
+            return False
+        else:
+            # Timeout
+            self._error(f"Timeout waiting for tag {expected_tag_id}")
+            return False
+
+    def _predict_next_position(self, cmd: CommandType) -> Optional[Tuple[int, int]]:
+        """
+        Predict position after executing command.
+
+        Args:
+            cmd: CommandType being executed
+
+        Returns:
+            (row, col) of next position, or None for turn commands
+        """
+        if cmd == CommandType.FORWARD:
+            heading_key = self.current_heading if isinstance(self.current_heading, Heading) else Heading(self.current_heading)
+            dr, dc = DIR_VECTORS[heading_key]
+            new_r = self.current_position[0] + dr
+            new_c = self.current_position[1] + dc
+            return (new_r, new_c)
+        elif cmd == CommandType.BACKWARD:
+            heading_key = self.current_heading if isinstance(self.current_heading, Heading) else Heading(self.current_heading)
+            dr, dc = DIR_VECTORS[heading_key]
+            new_r = self.current_position[0] - dr
+            new_c = self.current_position[1] - dc
+            return (new_r, new_c)
+        else:
+            # Turn commands don't change position
+            return None
+
+    def _get_tag_id_at_position(self, pos: Tuple[int, int]) -> Optional[int]:
+        """
+        Look up tag ID at grid position from detector's layout.
+
+        Args:
+            pos: (row, col) grid position
+
+        Returns:
+            tag_id if found in layout, None otherwise
+        """
+        if not self.detector:
+            return None
+
+        for tag_id, tag_pos in self.detector.tag_layout.items():
+            if tag_pos == pos:
+                return tag_id
+
+        return None
+
     def _execute_next_command(self) -> None:
         """
         Core state machine iteration.
-        Sends next command and waits for ACK.
+        Sends next command and waits for confirmation (AprilTag or serial ACK).
         """
         if self.robot_state and self.robot_state.status == "ERROR":
             self._error("Execution stopped due to ERROR status")
@@ -427,9 +568,9 @@ class ExecutionManager:
         self._set_state(ExecutionState.READY_TO_SEND)
         cmd = self.commands[self.command_index]
 
-        # Send command
+        # Send command and wait for confirmation
         self._set_state(ExecutionState.WAITING_FOR_ACK)
-        if not self.serial_cmd.send_and_wait(cmd):
+        if not self._send_and_wait_for_confirmation(cmd):
             self._error(f"Command failed: {cmd.value}")
             return
 
