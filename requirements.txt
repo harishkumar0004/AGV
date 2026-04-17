@@ -2,4 +2,6 @@ numpy
 matplotlib
 PyQt5
 networkx
-cv
+opencv-python
+apriltag
+pyserial
