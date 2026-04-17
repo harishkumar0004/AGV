@@ -1,5 +1,5 @@
-numpy==2.4.2
-matplotlib==3.10.8
-PyQt5==5.15.11
-networkx==3.6.1
-cv==1.0.0
+numpy
+matplotlib
+PyQt5
+networkx
+cv
