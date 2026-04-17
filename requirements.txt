@@ -1,7 +1,4 @@
-numpy<2
-apriltag
+numpy
 matplotlib
+PyQt5
 networkx
-pyserial
-opencv-python<4.11; platform_machine != "armv7l" and platform_machine != "aarch64"
-PyQt5; platform_machine != "armv7l" and platform_machine != "aarch64"

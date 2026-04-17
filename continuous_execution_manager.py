@@ -75,15 +75,21 @@ class ContinuousExecutionManager:
         self.turn_initial_rpm = 2
         self.turn_acc_rpm_per_sec = 10
         self.turn_search_step_deg = 12.0
-        self.turn_medium_step_deg = 6.0
         self.turn_fine_step_deg = 3.0
-        self.turn_angle_tolerance_deg = 8.0
         self.turn_center_tolerance_px = 35.0
         self.turn_rotation_tolerance_deg = 15.0
         self.turn_alignment_stable_reads = 2
         self.turn_detector_settle_sec = 0.20
         self.turn_timeout_sec = 20.0
         self._max_detection_age_sec = 0.75
+
+        # If the robot reaches the planned distance but the goal tag is still
+        # not visible, creep forward slowly in short pulses to recover.
+        self.goal_tag_creep_step_mm = 40.0
+        self.goal_tag_creep_max_distance_mm = 200.0
+        self.goal_tag_creep_max_rpm = 8
+        self.goal_tag_creep_initial_rpm = 2
+        self.goal_tag_creep_acc_rpm_per_sec = 8
         
         # Callbacks
         self.on_execution_started: Optional[Callable] = None
@@ -98,34 +104,6 @@ class ContinuousExecutionManager:
         """Keep the Qt UI responsive while execution runs in the foreground."""
         if QApplication is not None:
             QApplication.processEvents()
-
-    @staticmethod
-    def _normalize_angle_deg(angle_deg: float) -> float:
-        """Normalize any angle to the 0..360 range."""
-        return angle_deg % 360.0
-
-    @staticmethod
-    def _signed_angle_error_deg(target_deg: float, current_deg: float) -> float:
-        """Return the shortest signed angular error from current to target."""
-        return ((target_deg - current_deg + 180.0) % 360.0) - 180.0
-
-    @staticmethod
-    def _signed_turn_delta_deg(turn_direction: str, angle_deg: float) -> float:
-        """Map Arduino turn direction into the manager's signed robot-turn convention."""
-        return abs(angle_deg) if turn_direction == 'R' else -abs(angle_deg)
-
-    @staticmethod
-    def _tag_area_px(alignment: Dict) -> float:
-        """Estimate tag size in pixels so larger detections can be preferred as references."""
-        corners = alignment.get('corners') or []
-        if len(corners) < 4:
-            return 0.0
-
-        area = 0.0
-        for idx, (x1, y1) in enumerate(corners):
-            x2, y2 = corners[(idx + 1) % len(corners)]
-            area += (x1 * y2) - (x2 * y1)
-        return abs(area) * 0.5
 
     def is_connected(self) -> bool:
         """Return True when the Arduino serial port is open."""
@@ -379,101 +357,63 @@ class ContinuousExecutionManager:
         if turn_needed == 0:
             return True
         if turn_needed == 1:
-            return self._execute_closed_loop_turn(90.0, expected_tag_id)
+            return self._execute_closed_loop_turn('R', expected_tag_id)
         if turn_needed == 3:
-            return self._execute_closed_loop_turn(-90.0, expected_tag_id)
-        return self._execute_closed_loop_turn(180.0, expected_tag_id)
+            return self._execute_closed_loop_turn('L', expected_tag_id)
 
-    def _execute_closed_loop_turn(self, requested_turn_deg: float, expected_tag_id: Optional[int]) -> bool:
+        # Fall back to a 180° open-loop turn if ever needed.
+        return self._execute_turn_pulse('R', 180.0)
+
+    def _execute_closed_loop_turn(self, turn_direction: str, expected_tag_id: Optional[int]) -> bool:
         """
-        Rotate in place using the detector's 0..360 tag angle as feedback.
+        Rotate in place in small pulses until the expected next AprilTag is centered.
 
-        Positive `requested_turn_deg` means a right turn, negative means left.
-        The controller keeps the turn in closed loop by repeatedly measuring the
-        tag angle while the robot rotates in place.
+        This uses the expected next tag from the planned path as the visual
+        reference for left/right turns.
         """
         if not self.ensure_detector_running(wait=True, timeout_sec=5.0):
             self._error("Closed-loop turn requires a running AprilTag detector")
             return False
 
-        if abs(requested_turn_deg) < 1e-3:
-            return True
-
-        turn_direction = 'R' if requested_turn_deg > 0 else 'L'
-        estimated_remaining_turn_deg = float(requested_turn_deg)
-        reference_tag_id = None
-        reference_target_angle_deg = None
-        stable_reads = 0
-        seen_reference_once = False
+        if expected_tag_id is None:
+            self._error("Closed-loop turn requires an expected next tag")
+            return False
 
         print(
-            f"\n[ContinuousExecutionManager] Closed-loop in-place turn {turn_direction} "
-            f"{abs(requested_turn_deg):.1f}deg (expected tag={expected_tag_id})"
+            f"\n[ContinuousExecutionManager] Closed-loop turn {turn_direction} toward Tag {expected_tag_id}"
         )
+        stable_reads = 0
         deadline = time.time() + self.turn_timeout_sec
+        search_rotated_deg = 0.0
 
         while self.is_executing and time.time() < deadline:
             self._pump_ui_events()
-            if reference_tag_id is None:
-                reference_tag_id, alignment = self._select_turn_reference_tag(expected_tag_id)
-                if alignment is not None:
-                    seen_reference_once = True
-                    start_angle_deg = alignment['image_rotation_deg']
-                    reference_target_angle_deg = self._normalize_angle_deg(
-                        start_angle_deg - estimated_remaining_turn_deg
-                    )
-                    print(
-                        f"  [Turn] Reference Tag {reference_tag_id}: "
-                        f"start={start_angle_deg:.1f}deg "
-                        f"target={reference_target_angle_deg:.1f}deg "
-                        f"remaining={estimated_remaining_turn_deg:+.1f}deg"
-                    )
-                else:
-                    search_direction = turn_direction
-                    if seen_reference_once:
-                        search_direction = 'R' if estimated_remaining_turn_deg > 0 else 'L'
-                    pulse_deg = self._choose_turn_pulse_deg(
-                        estimated_remaining_turn_deg,
-                        tag_visible=False,
-                    )
-                    print(
-                        f"  [Turn] Searching for AprilTag reference: "
-                        f"{search_direction} {pulse_deg:.1f}deg"
-                    )
-                    if not self._execute_turn_pulse(search_direction, pulse_deg):
-                        return False
-                    estimated_remaining_turn_deg -= self._signed_turn_delta_deg(
-                        search_direction,
-                        pulse_deg,
-                    )
-                    stable_reads = 0
-                    time.sleep(self.turn_detector_settle_sec)
-                    continue
+            alignment = self._get_expected_tag_alignment(expected_tag_id)
 
-            alignment = self._get_tag_alignment(reference_tag_id)
             if alignment is None:
-                print(f"  [Turn] Lost Tag {reference_tag_id}, reacquiring...")
-                reference_tag_id = None
-                reference_target_angle_deg = None
                 stable_reads = 0
+                if not self._execute_turn_pulse(turn_direction, self.turn_search_step_deg):
+                    return False
+                search_rotated_deg += self.turn_search_step_deg
+                if search_rotated_deg > 150.0:
+                    self._error(
+                        f"Closed-loop turn could not find Tag {expected_tag_id} within {search_rotated_deg:.1f}deg"
+                    )
+                    return False
                 time.sleep(self.turn_detector_settle_sec)
                 continue
 
-            current_angle_deg = alignment['image_rotation_deg']
-            center_error_px = alignment.get('center_error_px', 0.0)
-            visual_error_deg = self._signed_angle_error_deg(
-                reference_target_angle_deg,
-                current_angle_deg,
-            )
-            estimated_remaining_turn_deg = -visual_error_deg
-
-            if abs(estimated_remaining_turn_deg) <= self.turn_angle_tolerance_deg:
+            search_rotated_deg = 0.0
+            error_px = alignment['center_error_px']
+            rotation_error_deg = alignment.get('rotation_error_deg', 0.0)
+            if (
+                abs(error_px) <= self.turn_center_tolerance_px
+                and abs(rotation_error_deg) <= self.turn_rotation_tolerance_deg
+            ):
                 stable_reads += 1
                 print(
-                    f"  [Turn] Tag {reference_tag_id} aligned "
-                    f"(angle={current_angle_deg:.1f}deg, "
-                    f"remaining={estimated_remaining_turn_deg:+.1f}deg, "
-                    f"center={center_error_px:.1f}px, "
+                    f"  [Turn] Tag {expected_tag_id} aligned "
+                    f"(error={error_px:.1f}px, rot={rotation_error_deg:.1f}deg, "
                     f"stable={stable_reads}/{self.turn_alignment_stable_reads})"
                 )
                 if stable_reads >= self.turn_alignment_stable_reads:
@@ -482,88 +422,31 @@ class ContinuousExecutionManager:
                 continue
 
             stable_reads = 0
-            correction_direction = 'R' if estimated_remaining_turn_deg > 0 else 'L'
-            pulse_deg = self._choose_turn_pulse_deg(
-                estimated_remaining_turn_deg,
-                tag_visible=True,
-            )
+            if abs(error_px) > self.turn_center_tolerance_px:
+                correction_direction = 'R' if error_px > 0 else 'L'
+                pulse_deg = (
+                    self.turn_fine_step_deg
+                    if abs(error_px) <= self.turn_center_tolerance_px * 3.0
+                    else self.turn_search_step_deg
+                )
+            else:
+                # Image rotation is opposite the camera yaw, so correct in the opposite direction.
+                correction_direction = 'R' if rotation_error_deg > 0 else 'L'
+                pulse_deg = self.turn_fine_step_deg
             print(
-                f"  [Turn] Tag {reference_tag_id} angle={current_angle_deg:.1f}deg, "
-                f"remaining={estimated_remaining_turn_deg:+.1f}deg, "
-                f"center={center_error_px:.1f}px -> "
+                f"  [Turn] Tag {expected_tag_id} error={error_px:.1f}px, "
+                f"rot={rotation_error_deg:.1f}deg, "
                 f"pulse={correction_direction} {pulse_deg:.1f}deg"
             )
             if not self._execute_turn_pulse(correction_direction, pulse_deg):
                 return False
-            estimated_remaining_turn_deg -= self._signed_turn_delta_deg(
-                correction_direction,
-                pulse_deg,
-            )
             time.sleep(self.turn_detector_settle_sec)
 
-        self._error(
-            f"Closed-loop turn timed out after requesting {requested_turn_deg:+.1f}deg"
-        )
+        self._error(f"Closed-loop turn timed out while aligning to Tag {expected_tag_id}")
         return False
-
-    def _choose_turn_pulse_deg(self, remaining_turn_deg: float, tag_visible: bool) -> float:
-        """Pick a pulse size based on how much angular error is left."""
-        remaining_abs = abs(remaining_turn_deg)
-        if remaining_abs <= self.turn_fine_step_deg:
-            return max(remaining_abs, self.turn_fine_step_deg)
-        if remaining_abs <= 20.0:
-            return min(remaining_abs, self.turn_medium_step_deg)
-        if tag_visible:
-            return min(remaining_abs, self.turn_search_step_deg)
-        return self.turn_search_step_deg
-
-    def _get_fresh_detection_details(self) -> Dict[int, Dict]:
-        """Return only recent detections that are safe to use for control."""
-        if not self.detector or not self.detector.is_running():
-            return {}
-
-        now = time.time()
-        detections = self.detector.get_last_detection_details()
-        return {
-            tag_id: details
-            for tag_id, details in detections.items()
-            if (now - details['timestamp']) <= self._max_detection_age_sec
-        }
-
-    def _select_turn_reference_tag(self, expected_tag_id: Optional[int]) -> Tuple[Optional[int], Optional[Dict]]:
-        """Choose the best currently visible tag to use as the angle reference."""
-        detections = self._get_fresh_detection_details()
-        if not detections:
-            return None, None
-
-        if expected_tag_id in detections:
-            return expected_tag_id, detections[expected_tag_id]
-
-        current_node_id = getattr(self.robot_state, 'current_node', None)
-        if current_node_id in detections:
-            return current_node_id, detections[current_node_id]
-
-        tag_id, details = max(
-            detections.items(),
-            key=lambda item: (
-                self._tag_area_px(item[1]),
-                -abs(item[1].get('center_error_px', 0.0)),
-            ),
-        )
-        return tag_id, details
-
-    def _get_tag_alignment(self, tag_id: Optional[int]) -> Optional[Dict]:
-        """Return fresh detector measurements for a specific tag."""
-        if tag_id is None:
-            return None
-        return self._get_fresh_detection_details().get(tag_id)
 
     def _execute_turn_pulse(self, turn_direction: str, angle_deg: float) -> bool:
         """Execute a short in-place turn pulse using the same trapezoidal controller."""
-        angle_deg = abs(angle_deg)
-        if angle_deg <= 0.0:
-            return True
-
         turn_distance_mm = self._angle_to_turn_distance_mm(angle_deg)
         expected_exec_time = self._estimate_motion_time_sec(
             turn_distance_mm,
@@ -585,7 +468,12 @@ class ContinuousExecutionManager:
         ):
             self._error(f"Failed to start turn pulse {turn_direction}")
             return False
-        return self._wait_for_motion_complete(expected_exec_time, waypoint_tags=None, emit_waypoints=False)
+        return self._wait_for_motion_complete(
+            expected_exec_time,
+            waypoint_tags=None,
+            emit_waypoints=False,
+            require_stop_tag_detection=False,
+        )
 
     def _execute_linear_segment(self, path_coords: List[Tuple[int, int]], path_node_ids: List[int]) -> bool:
         """Execute one straight segment between heading changes."""
@@ -612,6 +500,7 @@ class ContinuousExecutionManager:
             waypoint_tags=expected_tags,
             emit_waypoints=True,
             stop_on_tag_id=path_node_ids[-1] if path_node_ids else None,
+            require_stop_tag_detection=True,
         )
         if success and path_node_ids:
             self.robot_state.update_node(path_node_ids[-1])
@@ -638,12 +527,152 @@ class ContinuousExecutionManager:
         print(f"[ContinuousExecutionManager] START command: {start_command.strip()}")
         return self._send_command(start_command)
 
+    def _capture_waypoint_detections(
+        self,
+        waypoint_tags: Optional[set],
+        detected_waypoints: set,
+        min_timestamp: float,
+    ) -> None:
+        """Record fresh AprilTag detections for the active motion window."""
+        if not self.detector or not self.detector.is_running():
+            return
+
+        detected_tags = self.detector.get_last_detection_details()
+        for tag_id, tag_details in detected_tags.items():
+            if waypoint_tags is not None and tag_id not in waypoint_tags:
+                continue
+            if tag_details['timestamp'] < min_timestamp:
+                continue
+            if tag_id in detected_waypoints:
+                continue
+
+            tag_pos = tag_details['expected_pos']
+            print(f"\n  ✓ Waypoint {tag_id} detected at {tag_pos}")
+            detected_waypoints.add(tag_id)
+            if tag_id not in self.detected_tags_during_execution:
+                self.detected_tags_during_execution.append(tag_id)
+            self.robot_state.update_node(tag_id)
+
+            if self.on_waypoint_verified:
+                self.on_waypoint_verified(tag_id, True)
+
+    def _creep_forward_until_goal_tag(self, goal_tag_id: int, detected_waypoints: set) -> bool:
+        """Slowly creep forward in short pulses until the goal tag is detected."""
+        if not self.ensure_detector_running(wait=True, timeout_sec=5.0):
+            return False
+
+        print(
+            f"\n[ContinuousExecutionManager] Goal tag {goal_tag_id} missing at planned stop - "
+            f"creeping forward slowly"
+        )
+        total_creep_distance_mm = 0.0
+
+        while self.is_executing and total_creep_distance_mm < self.goal_tag_creep_max_distance_mm:
+            fresh_detection_window = time.time() - self._max_detection_age_sec
+            self._capture_waypoint_detections({goal_tag_id}, detected_waypoints, fresh_detection_window)
+            if goal_tag_id in detected_waypoints:
+                print(f"[ContinuousExecutionManager] Goal tag {goal_tag_id} detected without extra movement")
+                return True
+
+            pulse_distance_mm = min(
+                self.goal_tag_creep_step_mm,
+                self.goal_tag_creep_max_distance_mm - total_creep_distance_mm,
+            )
+            expected_exec_time = self._estimate_motion_time_sec(
+                pulse_distance_mm,
+                self.goal_tag_creep_max_rpm,
+                self.goal_tag_creep_initial_rpm,
+                self.goal_tag_creep_acc_rpm_per_sec,
+            )
+            print(
+                f"[ContinuousExecutionManager] Creep pulse: {pulse_distance_mm:.1f}mm "
+                f"(extra {total_creep_distance_mm + pulse_distance_mm:.1f}/"
+                f"{self.goal_tag_creep_max_distance_mm:.1f}mm)"
+            )
+
+            if not self._start_motion(
+                direction='F',
+                total_distance_mm=pulse_distance_mm,
+                distance_per_cell_mm=pulse_distance_mm,
+                max_rpm=self.goal_tag_creep_max_rpm,
+                initial_rpm=self.goal_tag_creep_initial_rpm,
+                acc_rpm_per_sec=self.goal_tag_creep_acc_rpm_per_sec,
+            ):
+                self._error(f"Failed to start slow creep toward goal tag {goal_tag_id}")
+                return False
+
+            pulse_start_time = time.time()
+            last_progress_time = pulse_start_time
+            hard_timeout = max(expected_exec_time * 2.0, expected_exec_time + 10.0)
+            tag_stop_requested = False
+
+            while self.is_executing:
+                self._pump_ui_events()
+                motion_done = False
+
+                if self.serial.in_waiting:
+                    line = self.serial.readline().decode('utf-8', errors='ignore').strip()
+                    if line:
+                        last_progress_time = time.time()
+
+                    if line.startswith('[POS]'):
+                        self._parse_position_update(line)
+                    elif line == "DONE":
+                        motion_done = True
+                    elif line.startswith('['):
+                        print(f"  [Arduino] {line}")
+
+                self._capture_waypoint_detections(
+                    {goal_tag_id},
+                    detected_waypoints,
+                    pulse_start_time - self._max_detection_age_sec,
+                )
+
+                if goal_tag_id in detected_waypoints and not tag_stop_requested and not motion_done:
+                    print(
+                        f"[ContinuousExecutionManager] Goal tag {goal_tag_id} detected during creep - "
+                        f"requesting stop"
+                    )
+                    if not self._send_command('X'):
+                        self._error(f"Failed to stop creep after detecting goal tag {goal_tag_id}")
+                        return False
+                    tag_stop_requested = True
+
+                if motion_done:
+                    total_creep_distance_mm += pulse_distance_mm
+                    if goal_tag_id in detected_waypoints:
+                        print(f"[ContinuousExecutionManager] Goal tag {goal_tag_id} confirmed after creep")
+                        return True
+                    break
+
+                elapsed = time.time() - pulse_start_time
+                stalled_for = time.time() - last_progress_time
+
+                if elapsed > hard_timeout:
+                    self._error(
+                        f"Slow creep timed out while searching for goal tag {goal_tag_id}"
+                    )
+                    self._stop_execution()
+                    return False
+
+                if elapsed > expected_exec_time and stalled_for > 5.0:
+                    self._error(
+                        f"Slow creep stalled while searching for goal tag {goal_tag_id}"
+                    )
+                    self._stop_execution()
+                    return False
+
+                time.sleep(0.05)
+
+        return goal_tag_id in detected_waypoints
+
     def _wait_for_motion_complete(
         self,
         expected_exec_time: float,
         waypoint_tags: Optional[set],
         emit_waypoints: bool,
         stop_on_tag_id: Optional[int] = None,
+        require_stop_tag_detection: bool = False,
     ) -> bool:
         """Wait for one motion segment to report DONE while monitoring progress."""
         print("\n[ContinuousExecutionManager] Monitoring motion segment...")
@@ -656,6 +685,7 @@ class ContinuousExecutionManager:
         try:
             while self.is_executing:
                 self._pump_ui_events()
+                motion_done = False
                 if self.serial.in_waiting:
                     line = self.serial.readline().decode('utf-8', errors='ignore').strip()
                     if line:
@@ -664,37 +694,39 @@ class ContinuousExecutionManager:
                     if line.startswith('[POS]'):
                         self._parse_position_update(line)
                     elif line == "DONE":
-                        print("\n[ContinuousExecutionManager] Motion complete (Arduino)")
-                        return True
+                        motion_done = True
                     elif line.startswith('['):
                         print(f"  [Arduino] {line}")
 
                 if emit_waypoints and self.detector and self.detector.is_running():
-                    detected_tags = self.detector.get_last_detection_details()
-                    for tag_id, tag_details in detected_tags.items():
-                        if waypoint_tags is not None and tag_id not in waypoint_tags:
-                            continue
-                        if tag_details['timestamp'] < start_time:
-                            continue
-                        if tag_id in detected_waypoints:
-                            continue
+                    self._capture_waypoint_detections(waypoint_tags, detected_waypoints, start_time)
 
-                        tag_pos = tag_details['expected_pos']
-                        print(f"\n  ✓ Waypoint {tag_id} detected at {tag_pos}")
-                        detected_waypoints.add(tag_id)
-                        self.robot_state.update_node(tag_id)
+                    if stop_on_tag_id is not None and stop_on_tag_id in detected_waypoints and not tag_stop_requested and not motion_done:
+                        print(
+                            f"[ContinuousExecutionManager] Goal tag {stop_on_tag_id} detected - requesting motion stop"
+                        )
+                        if not self._send_command('X'):
+                            self._error(f"Failed to send stop command after detecting goal tag {stop_on_tag_id}")
+                            return False
+                        tag_stop_requested = True
 
-                        if self.on_waypoint_verified:
-                            self.on_waypoint_verified(tag_id, True)
-
-                        if stop_on_tag_id is not None and tag_id == stop_on_tag_id and not tag_stop_requested:
-                            print(
-                                f"[ContinuousExecutionManager] Goal tag {tag_id} detected - requesting motion stop"
-                            )
-                            if not self._send_command('X'):
-                                self._error(f"Failed to send stop command after detecting goal tag {tag_id}")
-                                return False
-                            tag_stop_requested = True
+                if motion_done:
+                    if require_stop_tag_detection and stop_on_tag_id is not None and stop_on_tag_id not in detected_waypoints:
+                        if self._creep_forward_until_goal_tag(stop_on_tag_id, detected_waypoints):
+                            print("\n[ContinuousExecutionManager] Motion complete after slow goal-tag recovery")
+                            return True
+                        self._error(
+                            f"Motion finished before expected tag {stop_on_tag_id} was detected, "
+                            f"even after {self.goal_tag_creep_max_distance_mm:.0f}mm slow creep"
+                        )
+                        self._stop_execution()
+                        return False
+                    if waypoint_tags is not None and len(waypoint_tags) > 0 and not detected_waypoints:
+                        self._error("Motion finished before any expected path tag was detected in real time")
+                        self._stop_execution()
+                        return False
+                    print("\n[ContinuousExecutionManager] Motion complete (Arduino)")
+                    return True
 
                 elapsed = time.time() - start_time
                 stalled_for = time.time() - last_progress_time
@@ -724,7 +756,18 @@ class ContinuousExecutionManager:
 
     def _get_expected_tag_alignment(self, expected_tag_id: int) -> Optional[Dict]:
         """Return fresh detector measurements for the expected next tag."""
-        return self._get_tag_alignment(expected_tag_id)
+        if not self.detector or not self.detector.is_running():
+            return None
+
+        detections = self.detector.get_last_detection_details()
+        details = detections.get(expected_tag_id)
+        if not details:
+            return None
+
+        if (time.time() - details['timestamp']) > self._max_detection_age_sec:
+            return None
+
+        return details
 
     def _angle_to_turn_distance_mm(self, angle_deg: float) -> float:
         """Convert an in-place robot turn angle to per-wheel travel distance."""
